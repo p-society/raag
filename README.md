@@ -25,8 +25,8 @@
 
 <div align="center">
     <br/>
-    <img src='https://skillicons.dev/icons?i=go' width='70' height='70'>
-    <img src='https://github.com/p-society/raag/assets/119437069/02136b56-e5dc-4358-ae00-2c41f6b9b059' width='70' height='70' style='border-radius: 10px;'>
+    <img src='https://github.com/p-society/raag/assets/119437069/43759dc5-7386-4bc9-9598-bb95ad90ad8f' width='70' height='70'>
+    <img src='https://github.com/p-society/raag/assets/119437069/108a1ce3-107d-4a43-ad63-d34a007beab3' width='70' height='70' style='border-radius: 10px;'>
     <img src='https://github.com/p-society/raag/assets/119437069/c6e0493e-07b5-4af1-a35c-04c3012247e1' width='70' height='70' style='border-radius: 10px;'>
     <img src='https://github.com/p-society/raag/assets/119437069/b69a92ce-e818-4fac-b44a-5d0f58f909a5' width='70' height='70' style='border-radius: 10px;'>
 </div>
