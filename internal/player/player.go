@@ -5,46 +5,62 @@ import (
 	"os"
 	"time"
 
-	tag "github.com/dhowden/tag"
-	beep "github.com/faiface/beep"
-	mp3 "github.com/faiface/beep/mp3"
-	speaker "github.com/faiface/beep/speaker"
+	"github.com/faiface/beep"
+	"github.com/faiface/beep/mp3"
+	"github.com/faiface/beep/speaker"
+	"github.com/p-society/raag/internal/library"
 )
 
-func PlayMusic(filePath string) error {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("error opening file: %w", err)
-	}
-	defer file.Close()
+type Player struct {
+	ctrl   *beep.Ctrl
+	format beep.Format
+}
 
-	mdata, err := tag.ReadFrom(file)
-	if err != nil {
-		return fmt.Errorf("error reading tag: %w", err)
-	}
+func NewPlayer() *Player {
+	return &Player{}
+}
 
-	fmt.Printf("Now playing %s by %s\n", mdata.Title(), mdata.Artist())
-	_, err = file.Seek(0, 0)
+func (p *Player) Play(song library.Song) error {
+	f, err := os.Open(song.Path)
 	if err != nil {
-		return fmt.Errorf("error seeking file: %w", err)
+		return fmt.Errorf("error opening audio file: %w", err)
 	}
 
-	stream, format, err := mp3.Decode(file)
+	streamer, format, err := mp3.Decode(f)
 	if err != nil {
-		return fmt.Errorf("error decoding mp3 file: %w", err)
-	}
-	defer stream.Close()
-
-	err = speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-	if err != nil {
-		return fmt.Errorf("error initializing speaker: %w", err)
+		return fmt.Errorf("error decoding audio file: %w", err)
 	}
 
-	done := make(chan bool)
-	speaker.Play(beep.Seq(stream, beep.Callback(func() {
-		done <- true
-	})))
+	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
+	p.ctrl = &beep.Ctrl{Streamer: beep.Loop(-1, streamer)}
+	speaker.Play(p.ctrl)
+	p.format = format
 
-	<-done
+	fmt.Printf("Now playing: %s - %s\n", song.Title, song.Artist)
 	return nil
+}
+
+func (p *Player) Pause() {
+	if p.ctrl != nil {
+		speaker.Lock()
+		p.ctrl.Paused = true
+		speaker.Unlock()
+		fmt.Println("Playback paused")
+	}
+}
+
+func (p *Player) Resume() {
+	if p.ctrl != nil {
+		speaker.Lock()
+		p.ctrl.Paused = false
+		speaker.Unlock()
+		fmt.Println("Playback resumed")
+	}
+}
+
+func (p *Player) Stop() {
+	if p.ctrl != nil {
+		speaker.Clear()
+		fmt.Println("Playback stopped")
+	}
 }
