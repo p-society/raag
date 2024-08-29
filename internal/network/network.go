@@ -122,13 +122,6 @@ func (n *Network) handlePeer(ctx context.Context, peerInfo peer.AddrInfo) {
 		return
 	}
 
-	stream, err := n.host.NewStream(ctx, peerInfo.ID, protocol.ID(n.cfg.ProtocolID))
-	if err != nil {
-		log.Printf("Stream open failed: %v\n", err)
-		return
-	}
-	defer stream.Close()
-
 	n.peersLock.Lock()
 	n.peers[peerInfo.ID] = struct{}{}
 	n.peersLock.Unlock()
@@ -177,13 +170,8 @@ func (n *Network) handleStream(stream network.Stream) {
 
 	peerID := stream.Conn().RemotePeer()
 	log.Printf("handleStream called for peer: %s\n", peerID)
-	if err := stream.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		log.Printf("Error setting read deadline: %s\n", err)
-		return
-	}
 
 	buf := make([]byte, 1024)
-	log.Printf("Reading metadata from stream...\n")
 	size, err := stream.Read(buf)
 	if err != nil {
 		if err == io.EOF {
@@ -193,13 +181,6 @@ func (n *Network) handleStream(stream network.Stream) {
 		}
 		return
 	}
-
-	if err := stream.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("Error clearing read deadline: %s\n", err)
-		return
-	}
-
-	log.Printf("Read %d bytes of metadata from peer %s\n", size, peerID)
 
 	if size == 0 {
 		log.Printf("Received empty stream from peer %s, ignoring\n", peerID)
