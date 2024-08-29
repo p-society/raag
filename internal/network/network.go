@@ -73,6 +73,7 @@ func (n *Network) Start(ctx context.Context) error {
 
 func (n *Network) handleStream(stream network.Stream) {
 	fmt.Println("New peer connected!")
+	// Implement stream handling logic here
 }
 
 func (n *Network) handlePeer(ctx context.Context, peer peer.AddrInfo) {

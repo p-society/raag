@@ -97,11 +97,11 @@ func (c *CLI) shareSong(title string) {
 func (c *CLI) printHelp() {
 	fmt.Println("Available commands:")
 	fmt.Println("  list                 - List all songs in your library")
-	fmt.Println("  play <song title>    - Play a song")
+	fmt.Println("  play     - Play a song")
 	fmt.Println("  pause                - Pause the current playback")
 	fmt.Println("  resume               - Resume paused playback")
 	fmt.Println("  stop                 - Stop the current playback")
-	fmt.Println("  request <song title> - Request a song from peers")
-	fmt.Println("  share <song title>   - Share a song with peers")
+	fmt.Println("  request  - Request a song from peers")
+	fmt.Println("  share    - Share a song with peers")
 	fmt.Println("  help                 - Show this help message")
 }
