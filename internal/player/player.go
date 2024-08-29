@@ -7,7 +7,7 @@ import (
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
-	"github.com/p-society/raag/internal/library"
+	"github.com/p-society/raag/internal/metadata"
 )
 
 type Player struct {
@@ -24,7 +24,7 @@ func NewPlayer() (*Player, error) {
 	return &Player{}, nil
 }
 
-func (p *Player) Play(song library.Song) error {
+func (p *Player) Play(song metadata.Song) error {
 	if p.streamer != nil {
 		speaker.Clear()
 	}

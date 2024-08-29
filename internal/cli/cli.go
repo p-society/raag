@@ -2,7 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"log"
 
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/p-society/raag/internal/library"
 	"github.com/p-society/raag/internal/network"
 	"github.com/p-society/raag/internal/player"
@@ -128,12 +130,36 @@ func (c *CLI) requestCommand() *cobra.Command {
 
 func (c *CLI) shareCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "share [song title]",
-		Short: "Share a song with peers",
-		Args:  cobra.ExactArgs(1),
+		Use:   "share [peer ID] [song title]",
+		Short: "Share a song with a peer",
+		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("Sharing song: %s\n", args[0])
-			// TODO :- Implement song sharing logic here
+			peerID := args[0]
+			songTitle := args[1]
+
+			log.Printf("Attempting to share song '%s' with peer %s\n", songTitle, peerID)
+
+			song, err := c.library.FindSong(songTitle)
+			if err != nil {
+				log.Printf("Error: Song not found in library: %s\n", err)
+				return
+			}
+			log.Printf("Song found in library: %+v\n", song)
+
+			peerInfo, err := peer.AddrInfoFromString(peerID)
+			if err != nil {
+				log.Printf("Error parsing peer ID: %v\n", err)
+				return
+			}
+			log.Printf("Peer info parsed: %+v\n", peerInfo)
+
+			log.Printf("Calling ShareSong function...\n")
+			if err := c.network.ShareSong(peerInfo, song); err != nil {
+				log.Printf("Error sharing song: %v\n", err)
+				return
+			}
+
+			log.Printf("ShareSong function completed without errors\n")
 		},
 	}
 }

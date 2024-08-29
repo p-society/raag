@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	"github.com/p-society/raag/internal/config"
 	"github.com/p-society/raag/internal/library"
+	"github.com/p-society/raag/internal/metadata"
 )
 
 type Network struct {
@@ -133,32 +136,105 @@ func (n *Network) handlePeer(ctx context.Context, peerInfo peer.AddrInfo) {
 	log.Printf("Connected to peer: %s\n", peerInfo.ID)
 }
 
+func (n *Network) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) error {
+	log.Printf("ShareSong function called with peerInfo: %+v and song: %+v\n", peerInfo, song)
+
+	log.Printf("Creating new stream to peer %s\n", peerInfo.ID)
+	stream, err := n.host.NewStream(context.Background(), peerInfo.ID, protocol.ID(n.cfg.ProtocolID))
+	if err != nil {
+		return fmt.Errorf("failed to create stream: %w", err)
+	}
+	defer stream.Close()
+	log.Printf("Stream created successfully\n")
+
+	mdata := metadata.FormatMetadata(song)
+	log.Printf("Sending metadata: %s\n", mdata)
+	if _, err = stream.Write([]byte(mdata)); err != nil {
+		return fmt.Errorf("failed to send song metadata: %w", err)
+	}
+	log.Printf("Metadata sent successfully\n")
+
+	log.Printf("Opening file: %s\n", song.Path)
+	file, err := os.Open(song.Path)
+	if err != nil {
+		return fmt.Errorf("failed to open song file: %w", err)
+	}
+	defer file.Close()
+
+	log.Printf("Sending file data...\n")
+	bytesWritten, err := io.Copy(stream, file)
+	if err != nil {
+		return fmt.Errorf("failed to send song data: %w", err)
+	}
+	log.Printf("File data sent. Bytes written: %d\n", bytesWritten)
+
+	log.Printf("ShareSong function completed successfully\n")
+	return nil
+}
+
 func (n *Network) handleStream(stream network.Stream) {
 	defer stream.Close()
 
-	remotePeer := stream.Conn().RemotePeer().String()
-	log.Printf("New stream from: %s\n", remotePeer)
+	peerID := stream.Conn().RemotePeer()
+	log.Printf("handleStream called for peer: %s\n", peerID)
+	if err := stream.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Printf("Error setting read deadline: %s\n", err)
+		return
+	}
 
 	buf := make([]byte, 1024)
-	amt, err := stream.Read(buf)
+	log.Printf("Reading metadata from stream...\n")
+	size, err := stream.Read(buf)
 	if err != nil {
-		if err != io.EOF {
-			log.Printf("Error reading from stream: %v\n", err)
+		if err == io.EOF {
+			log.Printf("Stream closed by peer %s before sending data\n", peerID)
+		} else {
+			log.Printf("Error reading metadata from peer %s: %s\n", peerID, err)
 		}
 		return
 	}
 
-	message := string(buf[:amt])
-	log.Printf("Received message from %s: %s\n", remotePeer, message)
-
-	response := []byte("Hello from Raag!")
-	_, err = stream.Write(response)
-	if err != nil {
-		log.Printf("Error writing to stream: %v\n", err)
+	if err := stream.SetReadDeadline(time.Time{}); err != nil {
+		log.Printf("Error clearing read deadline: %s\n", err)
 		return
 	}
 
-	log.Printf("Sent response to %s: %s\n", remotePeer, string(response))
+	log.Printf("Read %d bytes of metadata from peer %s\n", size, peerID)
+
+	if size == 0 {
+		log.Printf("Received empty stream from peer %s, ignoring\n", peerID)
+		return
+	}
+
+	mdata := string(buf[:size])
+	log.Printf("Received metadata: %s\n", mdata)
+	songInfo := strings.Split(mdata, "|")
+	if len(songInfo) < 3 {
+		log.Printf("Invalid song metadata, fields may be missing or corrupted")
+		return
+	}
+
+	title := songInfo[0]
+	peerId := peerID.String()
+	fileName := fmt.Sprintf("%s_%s.mp3", peerId, title)
+	log.Printf("Preparing to save file as: %s\n", fileName)
+
+	file, err := os.Create(fileName)
+	if err != nil {
+		log.Printf("Error creating file: %s\n", err)
+		return
+	}
+	defer file.Close()
+
+	log.Printf("Copying song data from stream to file...\n")
+	bytesWritten, err := io.Copy(file, stream)
+	if err != nil {
+		log.Printf("Error saving song: %s\n", err)
+		return
+	}
+	log.Printf("Song data saved. Bytes written: %d\n", bytesWritten)
+
+	log.Printf("Successfully received and saved '%s' from peer '%s' as '%s'\n", title, peerID, fileName)
 }
 
 func (n *Network) initMDNS(peerhost host.Host, rendezvous string) <-chan peer.AddrInfo {
@@ -172,8 +248,4 @@ func (n *Network) initMDNS(peerhost host.Host, rendezvous string) <-chan peer.Ad
 	}
 
 	return peerChan
-}
-
-func (n *Network) IsNewNetwork() bool {
-	return n.isNewNetwork
 }

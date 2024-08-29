@@ -7,23 +7,19 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/dhowden/tag"
+	"github.com/p-society/raag/internal/metadata"
 )
 
-type Song struct {
-	Title  string
-	Artist string
-	Album  string
-	Path   string
-}
-
 type Library struct {
-	Songs []Song
+	Songs map[string]metadata.Song
 	mutex sync.RWMutex
 }
 
 func NewLibrary(musicDir string) (*Library, error) {
-	lib := &Library{}
+	lib := &Library{
+		Songs: make(map[string]metadata.Song),
+	}
+
 	if err := lib.ScanMusicLibrary(musicDir); err != nil {
 		return nil, fmt.Errorf("error scanning music library: %w", err)
 	}
@@ -34,55 +30,38 @@ func (l *Library) ScanMusicLibrary(musicDir string) error {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
-	l.Songs = []Song{}
+	l.Songs = make(map[string]metadata.Song)
 	return filepath.Walk(musicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".mp3") {
-			song, err := l.extractMetadata(path)
+			song, err := metadata.ExtractMetadata(path)
 			if err != nil {
 				return fmt.Errorf("error extracting metadata from %s: %w", path, err)
 			}
-			l.Songs = append(l.Songs, song)
+			l.Songs[strings.ToLower(song.Title)] = song
 		}
 		return nil
 	})
 }
 
-func (l *Library) extractMetadata(path string) (Song, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return Song{}, err
-	}
-	defer file.Close()
-
-	metadata, err := tag.ReadFrom(file)
-	if err != nil {
-		return Song{}, err
-	}
-
-	return Song{
-		Title:  metadata.Title(),
-		Artist: metadata.Artist(),
-		Album:  metadata.Album(),
-		Path:   path,
-	}, nil
-}
-
-func (l *Library) ListSongs() []Song {
+func (l *Library) ListSongs() []metadata.Song {
 	l.mutex.RLock()
 	defer l.mutex.RUnlock()
-	return l.Songs
-}
-
-func (l *Library) FindSong(title string) (Song, error) {
-	l.mutex.RLock()
-	defer l.mutex.RUnlock()
+	songs := make([]metadata.Song, 0, len(l.Songs))
 	for _, song := range l.Songs {
-		if strings.EqualFold(song.Title, title) {
-			return song, nil
-		}
+		songs = append(songs, song)
 	}
-	return Song{}, fmt.Errorf("song not found: %s", title)
+	return songs
+}
+
+func (l *Library) FindSong(title string) (metadata.Song, error) {
+	l.mutex.RLock()
+	defer l.mutex.RUnlock()
+	song, exists := l.Songs[strings.ToLower(title)]
+	if !exists {
+		return metadata.Song{}, fmt.Errorf("song not found: %s", title)
+	}
+	return song, nil
 }
