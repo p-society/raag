@@ -24,14 +24,17 @@ type Library struct {
 
 func NewLibrary(musicDir string) (*Library, error) {
 	lib := &Library{}
-	err := lib.ScanMusicLibrary(musicDir)
-	return lib, err
+	if err := lib.ScanMusicLibrary(musicDir); err != nil {
+		return nil, fmt.Errorf("error scanning music library: %w", err)
+	}
+	return lib, nil
 }
 
 func (l *Library) ScanMusicLibrary(musicDir string) error {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
+	l.Songs = []Song{}
 	return filepath.Walk(musicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -39,7 +42,7 @@ func (l *Library) ScanMusicLibrary(musicDir string) error {
 		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".mp3") {
 			song, err := l.extractMetadata(path)
 			if err != nil {
-				return err
+				return fmt.Errorf("error extracting metadata from %s: %w", path, err)
 			}
 			l.Songs = append(l.Songs, song)
 		}

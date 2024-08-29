@@ -3,7 +3,6 @@ package player
 import (
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/mp3"
@@ -12,15 +11,24 @@ import (
 )
 
 type Player struct {
-	ctrl   *beep.Ctrl
-	format beep.Format
+	ctrl     *beep.Ctrl
+	format   beep.Format
+	streamer beep.StreamSeeker
 }
 
-func NewPlayer() *Player {
-	return &Player{}
+func NewPlayer() (*Player, error) {
+	err := speaker.Init(44100, 44100/10)
+	if err != nil {
+		return nil, fmt.Errorf("error initializing speaker: %w", err)
+	}
+	return &Player{}, nil
 }
 
 func (p *Player) Play(song library.Song) error {
+	if p.streamer != nil {
+		speaker.Clear()
+	}
+
 	f, err := os.Open(song.Path)
 	if err != nil {
 		return fmt.Errorf("error opening audio file: %w", err)
@@ -28,13 +36,15 @@ func (p *Player) Play(song library.Song) error {
 
 	streamer, format, err := mp3.Decode(f)
 	if err != nil {
+		f.Close()
 		return fmt.Errorf("error decoding audio file: %w", err)
 	}
 
-	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-	p.ctrl = &beep.Ctrl{Streamer: beep.Loop(-1, streamer)}
-	speaker.Play(p.ctrl)
+	p.streamer = streamer
 	p.format = format
+	p.ctrl = &beep.Ctrl{Streamer: beep.Loop(-1, streamer)}
+
+	speaker.Play(p.ctrl)
 
 	fmt.Printf("Now playing: %s - %s\n", song.Title, song.Artist)
 	return nil

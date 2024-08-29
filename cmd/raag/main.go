@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,30 +16,32 @@ import (
 )
 
 func main() {
-	cfg := config.ParseFlags()
+	cfg, err := config.ParseFlags()
+	if err != nil {
+		log.Fatalf("Error parsing flags: %v", err)
+	}
 
 	lib, err := library.NewLibrary(cfg.MusicDir)
 	if err != nil {
-		fmt.Printf("Error initializing library: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Error initializing library: %v", err)
 	}
 
-	p := player.NewPlayer()
+	p, err := player.NewPlayer()
+	if err != nil {
+		log.Fatalf("Error initializing player: %v", err)
+	}
 
 	net, err := network.NewNetwork(cfg, lib)
 	if err != nil {
-		fmt.Printf("Error initializing network: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Error initializing network: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	errChan := make(chan error, 1)
 	go func() {
-		if err := net.Start(ctx); err != nil {
-			fmt.Printf("Error starting network: %v\n", err)
-			cancel()
-		}
+		errChan <- net.Start(ctx)
 	}()
 
 	cli := cli.NewCLI(lib, p, net)
@@ -46,7 +49,11 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
 
-	fmt.Println("\nShutting down...")
+	select {
+	case <-sigChan:
+		fmt.Println("\nShutting down...")
+	case err := <-errChan:
+		log.Printf("Error in network: %v", err)
+	}
 }

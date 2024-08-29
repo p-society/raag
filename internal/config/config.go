@@ -1,6 +1,9 @@
 package config
 
-import "flag"
+import (
+	"flag"
+	"fmt"
+)
 
 type Config struct {
 	RendezvousString string
@@ -10,7 +13,7 @@ type Config struct {
 	MusicDir         string
 }
 
-func ParseFlags() *Config {
+func ParseFlags() (*Config, error) {
 	c := &Config{}
 	flag.StringVar(&c.RendezvousString, "rendezvous", "raag-music-share", "Unique string to identify Raag nodes on the local network")
 	flag.StringVar(&c.ListenHost, "host", "0.0.0.0", "The host address to listen on")
@@ -18,5 +21,10 @@ func ParseFlags() *Config {
 	flag.IntVar(&c.ListenPort, "port", 0, "Node listen port (0 to pick a random unused port)")
 	flag.StringVar(&c.MusicDir, "musicdir", "./music", "Directory containing music files")
 	flag.Parse()
-	return c
+
+	if c.ListenPort < 0 || c.ListenPort > 65535 {
+		return nil, fmt.Errorf("invalid port number: %d", c.ListenPort)
+	}
+
+	return c, nil
 }
