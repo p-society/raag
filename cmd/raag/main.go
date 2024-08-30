@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -45,14 +44,19 @@ func main() {
 	}()
 
 	cli := cli.NewCLI(lib, p, net)
-	go cli.Start()
+	go func() {
+		if err := cli.Start(); err != nil {
+			log.Printf("Error in CLI: %v", err)
+			cancel()
+		}
+	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case <-sigChan:
-		fmt.Println("\nShutting down...")
+		log.Println("Received termination signal, shutting down...")
 	case err := <-errChan:
 		log.Printf("Error in network: %v", err)
 	}

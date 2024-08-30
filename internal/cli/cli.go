@@ -13,11 +13,11 @@ import (
 type CLI struct {
 	library *library.Library
 	player  *player.Player
-	network *network.Network
+	network *network.NetworkManager
 	rootCmd *cobra.Command
 }
 
-func NewCLI(lib *library.Library, p *player.Player, net *network.Network) *CLI {
+func NewCLI(lib *library.Library, p *player.Player, net *network.NetworkManager) *CLI {
 	cli := &CLI{
 		library: lib,
 		player:  p,
@@ -60,7 +60,6 @@ func (c *CLI) shareCommand() *cobra.Command {
 			}
 			log.Printf("Peer info parsed: %+v\n", peerInfo)
 
-			log.Printf("Calling ShareSong function...\n")
 			if err := c.network.ShareSong(peerInfo, song); err != nil {
 				log.Printf("Error sharing song: %v\n", err)
 				return
@@ -71,6 +70,6 @@ func (c *CLI) shareCommand() *cobra.Command {
 	}
 }
 
-func (cli *CLI) Start() error {
-	return cli.rootCmd.Execute()
+func (c *CLI) Start() error {
+	return c.rootCmd.Execute()
 }

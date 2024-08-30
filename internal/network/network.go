@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -24,13 +23,12 @@ import (
 	"github.com/p-society/raag/internal/metadata"
 )
 
-type Network struct {
-	host         host.Host
-	cfg          *config.Config
-	library      *library.Library
-	peers        map[peer.ID]struct{}
-	peersLock    sync.RWMutex
-	isNewNetwork bool
+type NetworkManager struct {
+	host      host.Host
+	cfg       *config.Config
+	library   *library.Library
+	peers     map[peer.ID]struct{}
+	peersLock sync.RWMutex
 }
 
 type discoveryNotifee struct {
@@ -41,7 +39,7 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	n.PeerChan <- pi
 }
 
-func NewNetwork(cfg *config.Config, lib *library.Library) (*Network, error) {
+func NewNetwork(cfg *config.Config, lib *library.Library) (*NetworkManager, error) {
 	prvKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key pair: %w", err)
@@ -57,7 +55,7 @@ func NewNetwork(cfg *config.Config, lib *library.Library) (*Network, error) {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	return &Network{
+	return &NetworkManager{
 		host:    host,
 		cfg:     cfg,
 		library: lib,
@@ -65,46 +63,11 @@ func NewNetwork(cfg *config.Config, lib *library.Library) (*Network, error) {
 	}, nil
 }
 
-func (n *Network) Start(ctx context.Context) error {
+func (n *NetworkManager) Start(ctx context.Context) error {
 	n.host.SetStreamHandler(protocol.ID(n.cfg.ProtocolID), n.handleStream)
 	peerChan := n.initMDNS(n.host, n.cfg.RendezvousString)
 
 	log.Printf("Your Raag Node Multiaddress Is: /ip4/%s/tcp/%v/p2p/%s\n", n.cfg.ListenHost, n.cfg.ListenPort, n.host.ID())
-
-	maxWait := 30 * time.Second
-	waitInterval := 1 * time.Second
-	waited := 0 * time.Second
-	extendedWait := false
-
-	for waited < maxWait || extendedWait {
-		n.peersLock.RLock()
-		peerCount := len(n.peers)
-		n.peersLock.RUnlock()
-
-		if peerCount > 0 {
-			log.Printf("Found %d peers with the current protocol ID.\n", peerCount)
-			break
-		}
-
-		select {
-		case peer := <-peerChan:
-			go n.handlePeer(ctx, peer)
-			extendedWait = true
-			waited = 0
-		default:
-			if !extendedWait {
-				log.Println("Waiting for peers...")
-			}
-			extendedWait = false
-			time.Sleep(waitInterval)
-			waited += waitInterval
-		}
-	}
-
-	if !extendedWait && waited >= maxWait {
-		log.Println("No peers found with the current protocol ID. Starting a new network.")
-		n.isNewNetwork = true
-	}
 
 	for {
 		select {
@@ -116,7 +79,7 @@ func (n *Network) Start(ctx context.Context) error {
 	}
 }
 
-func (n *Network) handlePeer(ctx context.Context, peerInfo peer.AddrInfo) {
+func (n *NetworkManager) handlePeer(ctx context.Context, peerInfo peer.AddrInfo) {
 	if err := n.host.Connect(ctx, peerInfo); err != nil {
 		log.Printf("Connection failed: %v\n", err)
 		return
@@ -129,43 +92,54 @@ func (n *Network) handlePeer(ctx context.Context, peerInfo peer.AddrInfo) {
 	log.Printf("Connected to peer: %s\n", peerInfo.ID)
 }
 
-func (n *Network) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) error {
+func (n *NetworkManager) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) error {
 	log.Printf("ShareSong function called with peerInfo: %+v and song: %+v\n", peerInfo, song)
+	dataChan := make(chan []byte)
+	go func() {
+		defer close(dataChan)
+		file, err := os.Open(song.Path)
+		if err != nil {
+			log.Printf("Error opening file: %s\n", err)
+			return
+		}
+		defer file.Close()
 
-	log.Printf("Creating new stream to peer %s\n", peerInfo.ID)
+		buffer := make([]byte, 1024)
+		for {
+			n, err := file.Read(buffer)
+			if err != nil && err != io.EOF {
+				log.Printf("Error reading file: %s\n", err)
+				return
+			}
+			if n == 0 {
+				break
+			}
+			dataChan <- buffer[:n]
+		}
+	}()
+
 	stream, err := n.host.NewStream(context.Background(), peerInfo.ID, protocol.ID(n.cfg.ProtocolID))
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 	defer stream.Close()
-	log.Printf("Stream created successfully\n")
 
 	mdata := metadata.FormatMetadata(song)
-	log.Printf("Sending metadata: %s\n", mdata)
 	if _, err = stream.Write([]byte(mdata)); err != nil {
 		return fmt.Errorf("failed to send song metadata: %w", err)
 	}
-	log.Printf("Metadata sent successfully\n")
 
-	log.Printf("Opening file: %s\n", song.Path)
-	file, err := os.Open(song.Path)
-	if err != nil {
-		return fmt.Errorf("failed to open song file: %w", err)
+	for data := range dataChan {
+		if _, err = stream.Write(data); err != nil {
+			return fmt.Errorf("failed to send song data: %w", err)
+		}
 	}
-	defer file.Close()
-
-	log.Printf("Sending file data...\n")
-	bytesWritten, err := io.Copy(stream, file)
-	if err != nil {
-		return fmt.Errorf("failed to send song data: %w", err)
-	}
-	log.Printf("File data sent. Bytes written: %d\n", bytesWritten)
 
 	log.Printf("ShareSong function completed successfully\n")
 	return nil
 }
 
-func (n *Network) handleStream(stream network.Stream) {
+func (n *NetworkManager) handleStream(stream network.Stream) {
 	defer stream.Close()
 
 	peerID := stream.Conn().RemotePeer()
@@ -218,7 +192,7 @@ func (n *Network) handleStream(stream network.Stream) {
 	log.Printf("Successfully received and saved '%s' from peer '%s' as '%s'\n", title, peerID, fileName)
 }
 
-func (n *Network) initMDNS(peerhost host.Host, rendezvous string) <-chan peer.AddrInfo {
+func (n *NetworkManager) initMDNS(peerhost host.Host, rendezvous string) <-chan peer.AddrInfo {
 	notifee := &discoveryNotifee{}
 	peerChan := make(chan peer.AddrInfo)
 	notifee.PeerChan = peerChan
