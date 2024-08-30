@@ -19,3 +19,10 @@
 
 # Go workspace file
 go.work
+
+#Other files
+
+#o/p binary
+raag
+#Currently musicDir flag is hardcoded, hence this needs to be ignored
+music/
