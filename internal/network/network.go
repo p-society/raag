@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -17,11 +18,15 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/p-society/raag/internal/config"
 	"github.com/p-society/raag/internal/library"
 	"github.com/p-society/raag/internal/metadata"
 )
+
+//TODO :- offline and online detection by the application
 
 type NetworkManager struct {
 	host      host.Host
@@ -45,12 +50,20 @@ func NewNetwork(cfg *config.Config, lib *library.Library) (*NetworkManager, erro
 		return nil, fmt.Errorf("failed to generate key pair: %w", err)
 	}
 
+	var opts []libp2p.Option
+
 	sourceMultiAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", cfg.ListenHost, cfg.ListenPort))
 
-	host, err := libp2p.New(
-		libp2p.ListenAddrs(sourceMultiAddr),
-		libp2p.Identity(prvKey),
-	)
+	opts = append(opts, libp2p.ListenAddrs(sourceMultiAddr), libp2p.Identity(prvKey))
+	if cfg.Offline {
+		opts = append(opts, libp2p.NoTransports, libp2p.Transport(tcp.NewTCPTransport))
+		opts = append(opts, libp2p.ConnectionManager(NewConnectionManager(10, 15, time.Minute)))
+
+	} else if cfg.Wifi {
+		opts = append(opts, libp2p.DefaultTransports)
+	}
+
+	host, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
@@ -71,18 +84,38 @@ func NewNetwork(cfg *config.Config, lib *library.Library) (*NetworkManager, erro
 	return nm, nil
 }
 
+func NewConnectionManager(low, high int, gracePeriod time.Duration) *connmgr.BasicConnMgr {
+	cm, _ := connmgr.NewConnManager(low, high, connmgr.WithGracePeriod(gracePeriod))
+	return cm
+}
+
 func (n *NetworkManager) Start(ctx context.Context) error {
 	n.host.SetStreamHandler(protocol.ID(n.cfg.ProtocolID), n.handleStream)
-	peerChan := n.initMDNS(n.host, n.cfg.RendezvousString)
+
+	if n.cfg.Offline {
+		peerChan := n.initMDNS(n.host, n.cfg.RendezvousString)
+		go n.discoverPeers(ctx, peerChan)
+	} else if n.cfg.Wifi {
+		peerChan := n.initMDNS(n.host, n.cfg.RendezvousString)
+		go n.discoverPeers(ctx, peerChan)
+	}
+
+	//TODO :- if wifi enabled, should we use kademlia along with mDNS for peer discovery?
 
 	log.Printf("Your Raag Node Multiaddress Is: /ip4/%s/tcp/%v/p2p/%s\n", n.cfg.ListenHost, n.cfg.ListenPort, n.host.ID())
 
+	<-ctx.Done()
+	return ctx.Err()
+
+}
+
+func (n *NetworkManager) discoverPeers(ctx context.Context, peerChan <-chan peer.AddrInfo) {
 	for {
 		select {
 		case peer := <-peerChan:
 			go n.handlePeer(ctx, peer)
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		}
 	}
 }
