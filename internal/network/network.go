@@ -55,12 +55,20 @@ func NewNetwork(cfg *config.Config, lib *library.Library) (*NetworkManager, erro
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
 	}
 
-	return &NetworkManager{
+	nm := &NetworkManager{
 		host:    host,
 		cfg:     cfg,
 		library: lib,
 		peers:   make(map[peer.ID]struct{}),
-	}, nil
+	}
+
+	host.Network().Notify(&network.NotifyBundle{
+		DisconnectedF: func(n network.Network, conn network.Conn) {
+			nm.handlePeerDisconnect(conn.RemotePeer(), conn.RemoteMultiaddr())
+		},
+	})
+
+	return nm, nil
 }
 
 func (n *NetworkManager) Start(ctx context.Context) error {
@@ -203,4 +211,14 @@ func (n *NetworkManager) initMDNS(peerhost host.Host, rendezvous string) <-chan 
 	}
 
 	return peerChan
+}
+
+func (n *NetworkManager) handlePeerDisconnect(peerId peer.ID, addr multiaddr.Multiaddr) {
+	n.peersLock.Lock()
+	defer n.peersLock.Unlock()
+
+	if _, ok := n.peers[peerId]; ok {
+		delete(n.peers, peerId)
+		log.Printf("Peer %s has disconnected: %s", peerId, addr.String())
+	}
 }
