@@ -236,11 +236,6 @@ Security features:
 railway up
 ```
 
-3. Enable networking in Railway:
-   - Go to Service Settings → Networking
-   - Add TCP port 45678
-   - Add UDP port 45678
-
 ### Local Docker
 
 ```bash
