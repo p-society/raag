@@ -1,10 +1,17 @@
 package library
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/p-society/raag/internal/metadata"
 )
+
+func newTestLibrary() *Library {
+	lib := &Library{}
+	lib.Songs.Store(&sync.Map{})
+	return lib
+}
 
 func TestNewLibrary(t *testing.T) {
 	_, err := NewLibrary("./testdata")
@@ -14,30 +21,29 @@ func TestNewLibrary(t *testing.T) {
 }
 
 func TestListSongs(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
+	lib := newTestLibrary()
+	songsMap := lib.Songs.Load()
+	songsMap.Store("song1", metadata.Song{Title: "Song 1"})
+	songsMap.Store("song2", metadata.Song{Title: "Song 2"})
+
+	count := 0
+	for range lib.AllSongs() {
+		count++
 	}
 
-	lib.Songs["song1"] = metadata.Song{Title: "Song 1"}
-	lib.Songs["song2"] = metadata.Song{Title: "Song 2"}
-
-	songs := lib.ListSongs()
-
-	if len(songs) != 2 {
-		t.Errorf("ListSongs() = %d, want 2", len(songs))
+	if count != 2 {
+		t.Errorf("AllSongs() count = %d, want 2", count)
 	}
 }
 
 func TestFindSong(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
-	}
-
-	lib.Songs["test song"] = metadata.Song{
+	lib := newTestLibrary()
+	songsMap := lib.Songs.Load()
+	songsMap.Store("test song", metadata.Song{
 		Title:  "Test Song",
 		Artist: "Test Artist",
 		Album:  "Test Album",
-	}
+	})
 
 	song, err := lib.FindSong("test song")
 	if err != nil {
@@ -54,10 +60,7 @@ func TestFindSong(t *testing.T) {
 }
 
 func TestAddSong(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
-	}
-
+	lib := newTestLibrary()
 	err := lib.AddSong("/fake/path/song.mp3")
 	if err != nil {
 		t.Logf("AddSong error (expected if file doesn't exist): %v", err)
@@ -65,18 +68,25 @@ func TestAddSong(t *testing.T) {
 }
 
 func TestRemoveSong(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
-	}
+	lib := newTestLibrary()
+	songsMap := lib.Songs.Load()
+	songsMap.Store("abc123", metadata.Song{Title: "Test Song", Hash: "abc123"})
 
-	lib.Songs["test song"] = metadata.Song{Title: "Test Song"}
-
-	err := lib.RemoveSong("test song")
+	err := lib.RemoveSong("Test Song")
 	if err != nil {
 		t.Errorf("RemoveSong() error = %v", err)
 	}
 
-	if _, exists := lib.Songs["test song"]; exists {
+	songsMap = lib.Songs.Load()
+	var exists bool
+	songsMap.Range(func(key, value any) bool {
+		if key == "abc123" {
+			exists = true
+			return false
+		}
+		return true
+	})
+	if exists {
 		t.Error("RemoveSong() should remove song from library")
 	}
 
@@ -87,32 +97,26 @@ func TestRemoveSong(t *testing.T) {
 }
 
 func TestGetByArtist(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
-	}
-
-	lib.Songs["song1"] = metadata.Song{Title: "Song 1", Artist: "Artist A"}
-	lib.Songs["song2"] = metadata.Song{Title: "Song 2", Artist: "Artist B"}
-	lib.Songs["song3"] = metadata.Song{Title: "Song 3", Artist: "Artist A"}
+	lib := newTestLibrary()
+	songsMap := lib.Songs.Load()
+	songsMap.Store("song1", metadata.Song{Title: "Song 1", Artist: "Artist A"})
+	songsMap.Store("song2", metadata.Song{Title: "Song 2", Artist: "Artist B"})
+	songsMap.Store("song3", metadata.Song{Title: "Song 3", Artist: "Artist A"})
 
 	songs := lib.GetByArtist("Artist A")
-
 	if len(songs) != 2 {
 		t.Errorf("GetByArtist() = %d, want 2", len(songs))
 	}
 }
 
 func TestGetByAlbum(t *testing.T) {
-	lib := &Library{
-		Songs: make(map[string]metadata.Song),
-	}
-
-	lib.Songs["song1"] = metadata.Song{Title: "Song 1", Album: "Album A"}
-	lib.Songs["song2"] = metadata.Song{Title: "Song 2", Album: "Album B"}
-	lib.Songs["song3"] = metadata.Song{Title: "Song 3", Album: "Album A"}
+	lib := newTestLibrary()
+	songsMap := lib.Songs.Load()
+	songsMap.Store("song1", metadata.Song{Title: "Song 1", Album: "Album A"})
+	songsMap.Store("song2", metadata.Song{Title: "Song 2", Album: "Album B"})
+	songsMap.Store("song3", metadata.Song{Title: "Song 3", Album: "Album A"})
 
 	songs := lib.GetByAlbum("Album A")
-
 	if len(songs) != 2 {
 		t.Errorf("GetByAlbum() = %d, want 2", len(songs))
 	}

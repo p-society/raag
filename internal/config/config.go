@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -9,31 +11,35 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Config holds persistent configuration values only
-// Runtime state (volume, playback, etc.) is stored in state.json
+// Config holds persistent configuration values only.
+// Runtime state (volume, playback, etc.) is stored in state.json.
 type Config struct {
 	// Network - persistent network settings
-	Host       string
-	Port       int
-	Rendezvous string
+	Host       string `json:"network.host"`
+	Port       int    `json:"network.port"`
+	Rendezvous string `json:"network.rendezvous"`
 
 	// Discovery - persistent discovery settings
-	TrackerURL     string
-	DHTEnabled     bool
-	MaxPeers       int
-	BootstrapPeers []string
+	TrackerURL     string   `json:"discovery.tracker_url"`
+	DHTEnabled     bool     `json:"discovery.dht_enabled"`
+	MaxPeers       int      `json:"discovery.max_peers"`
+	BootstrapPeers []string `json:"discovery.bootstrap_peers"`
+	AuthSecret     string   `mapstructure:"-" json:"-"`
 
 	// Playback - persistent playback settings
-	MusicDir string
-
-	// Runtime - these are set at startup and not persisted
-	Network  bool   // Runtime: whether network mode is enabled
-	Volume   int    // Runtime: current volume (loaded from state.json)
-	TUI      bool   // Runtime: whether to start TUI
-	LogLevel string // Runtime: logging level
+	MusicDir string `json:"playback.music_dir"`
+	// Runtime - these are set at startup
+	Network  bool   `mapstructure:"-" json:"-"`
+	Volume   int    `mapstructure:"-" json:"-"`
+	TUI      bool   `mapstructure:"-" json:"-"`
+	LogLevel string `mapstructure:"-" json:"-"`
 }
 
 func DefaultConfig() Config {
+	musicDir := "./music"
+	if defaultMusicDir, err := MusicDir(); err == nil {
+		musicDir = defaultMusicDir
+	}
 	return Config{
 		Host:           constants.DefaultHost,
 		Port:           constants.DefaultPort,
@@ -42,7 +48,7 @@ func DefaultConfig() Config {
 		DHTEnabled:     true,
 		MaxPeers:       constants.DefaultMaxPeers,
 		BootstrapPeers: []string{},
-		MusicDir:       "./music",
+		MusicDir:       musicDir,
 		Volume:         constants.DefaultVolume,
 		Network:        false,
 		LogLevel:       "info",
@@ -52,18 +58,16 @@ func DefaultConfig() Config {
 // InitViper initializes Viper with defaults and binds flags
 func InitViper(cmd *cobra.Command) (*viper.Viper, error) {
 	v := viper.New()
-
 	configDir, err := Dir()
 	if err != nil {
 		return nil, fmt.Errorf("could not get user config dir: %w", err)
 	}
 
-	configPath := configDir
 	configFile, err := FilePath()
 	if err != nil {
 		return nil, fmt.Errorf("could not determine config file: %w", err)
 	}
-	if err := os.MkdirAll(configPath, 0o755); err != nil {
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return nil, fmt.Errorf("could not create config dir: %w", err)
 	}
 
@@ -96,88 +100,68 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("discovery.dht_enabled", defaults.DHTEnabled)
 	v.SetDefault("discovery.max_peers", defaults.MaxPeers)
 	v.SetDefault("discovery.bootstrap_peers", defaults.BootstrapPeers)
+	v.SetDefault("discovery.auth_secret", os.Getenv("AUTH_SECRET"))
 	v.SetDefault("playback.music_dir", defaults.MusicDir)
-	// Runtime defaults (not persisted)
-	v.SetDefault("runtime.volume", defaults.Volume)
-	v.SetDefault("runtime.network", defaults.Network)
-	v.SetDefault("runtime.log_level", defaults.LogLevel)
 }
 
 func bindFlags(v *viper.Viper, cmd *cobra.Command) {
 	root := cmd.Root()
-	// Network flags
 	v.BindPFlag("network.host", root.PersistentFlags().Lookup("host"))
 	v.BindPFlag("network.port", root.PersistentFlags().Lookup("port"))
 	v.BindPFlag("network.rendezvous", root.PersistentFlags().Lookup("rendezvous"))
-
-	// Discovery flags
 	v.BindPFlag("discovery.tracker_url", root.PersistentFlags().Lookup("tracker"))
 	v.BindPFlag("discovery.dht_enabled", root.PersistentFlags().Lookup("dht"))
 	v.BindPFlag("discovery.max_peers", root.PersistentFlags().Lookup("max-peers"))
 	v.BindPFlag("discovery.bootstrap_peers", root.PersistentFlags().Lookup("bootstrap"))
-
-	// Playback flags
+	v.BindPFlag("discovery.auth_secret", root.PersistentFlags().Lookup("auth-secret"))
 	v.BindPFlag("playback.music_dir", root.PersistentFlags().Lookup("music-dir"))
-
-	// Runtime flags (not persisted)
-	v.BindPFlag("runtime.network", root.PersistentFlags().Lookup("network"))
 }
 
-// LoadConfig loads configuration from Viper instance
+// LoadConfig loads configuration from Viper instance.
 func LoadConfig(v *viper.Viper) (*Config, error) {
 	cfg := &Config{
 		Host:           v.GetString("network.host"),
 		Port:           v.GetInt("network.port"),
 		Rendezvous:     v.GetString("network.rendezvous"),
-		TrackerURL:     getTrackerURL(v),
+		TrackerURL:     v.GetString("discovery.tracker_url"),
 		DHTEnabled:     v.GetBool("discovery.dht_enabled"),
 		MaxPeers:       v.GetInt("discovery.max_peers"),
 		BootstrapPeers: v.GetStringSlice("discovery.bootstrap_peers"),
+		AuthSecret:     v.GetString("discovery.auth_secret"),
 		MusicDir:       v.GetString("playback.music_dir"),
-		// Runtime fields (loaded from CLI flags, not persisted)
-		Network:  v.GetBool("runtime.network"),
-		LogLevel: v.GetString("runtime.log_level"),
 	}
 
+	if cfg.TrackerURL == "" {
+		if url := os.Getenv(constants.EnvTrackerURL); url != "" {
+			cfg.TrackerURL = url
+		} else {
+			cfg.TrackerURL = constants.DefaultTrackerURL
+		}
+	}
 	if cfg.Port < 0 || cfg.Port > 65535 {
 		return nil, fmt.Errorf("invalid port number: %d", cfg.Port)
 	}
-
 	return cfg, nil
 }
 
-// getTrackerURL returns the tracker URL with priority:
-// 1. CLI flag (via config file)
-// 2. Environment variable
-// 3. Default value
-func getTrackerURL(v *viper.Viper) string {
-	if url := v.GetString("discovery.tracker_url"); url != "" {
-		return url
-	}
-	if url := os.Getenv(constants.EnvTrackerURL); url != "" {
-		return url
-	}
-	return constants.DefaultTrackerURL
-}
-
-// SaveConfig saves current configuration to file
+// SaveConfig saves persistent configuration values to file.
 func SaveConfig(v *viper.Viper, cfg *Config) error {
-	v.Set("network.host", cfg.Host)
-	v.Set("network.port", cfg.Port)
-	v.Set("network.rendezvous", cfg.Rendezvous)
+	jsonBytes, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
 
-	v.Set("discovery.tracker_url", cfg.TrackerURL)
-	v.Set("discovery.dht_enabled", cfg.DHTEnabled)
-	v.Set("discovery.max_peers", cfg.MaxPeers)
-	v.Set("discovery.bootstrap_peers", cfg.BootstrapPeers)
-
-	v.Set("playback.music_dir", cfg.MusicDir)
-
-	return v.WriteConfig()
-}
-
-// UpdateBootstrapPeers updates just the bootstrap_peers in config file
-func UpdateBootstrapPeers(v *viper.Viper, peers []string) error {
-	v.Set("discovery.bootstrap_peers", peers)
+	var configMap map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(jsonBytes))
+	decoder.UseNumber()
+	if err := decoder.Decode(&configMap); err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	for key, value := range configMap {
+		if value == nil {
+			continue
+		}
+		v.Set(key, value)
+	}
 	return v.WriteConfig()
 }

@@ -18,4 +18,12 @@ COPY --from=builder /app/tracker .
 
 EXPOSE 8080 45678
 
-CMD ["sh", "-c", "./tracker --http-port ${PORT:-8080} --libp2p-port 45678 --relay ${AUTH_KEY:+--auth-key $AUTH_KEY}"]
+ENV PORT=8080
+ENV LIBP2P_PORT=45678
+ENV AUTH_SECRET=${AUTH_SECRET:-}
+ENV TLS_ENABLED=
+ENV TLS_CERT_FILE=
+ENV TLS_KEY_FILE=
+
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["./tracker --http-port $PORT --libp2p-port $LIBP2P_PORT --relay $([ \"$TLS_ENABLED\" = \"true\" ] && echo \"--tls\") $([ -n \"$TLS_CERT_FILE\" ] && echo \"--tls-cert $TLS_CERT_FILE\") $([ -n \"$TLS_KEY_FILE\" ] && echo \"--tls-key $TLS_KEY_FILE\")"]

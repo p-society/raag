@@ -19,6 +19,9 @@ const (
 
 	// EnvTrackerURL is the environment variable name for tracker URL
 	EnvTrackerURL = "TRACKER_URL"
+
+	// EnvAuthSecret is the environment variable name for shared auth secret
+	EnvAuthSecret = "AUTH_SECRET"
 )
 
 // Peer Discovery
@@ -34,6 +37,9 @@ const (
 
 	// PeerTimeout is how long before a peer is considered stale
 	PeerTimeout = 10 * time.Minute
+
+	// NonceExpiry is how long used nonces are kept (prevents reuse within token validity)
+	NonceExpiry = 24 * time.Hour
 )
 
 // Discovery Intervals
@@ -50,29 +56,35 @@ const (
 	// MDNSLogInterval is how often to log mDNS peer count
 	MDNSLogInterval = 10 * time.Second
 
-	// TrackerRetryInterval is how long to wait before retrying tracker connection
-	TrackerRetryInterval = 5 * time.Minute
-
 	// TrackerHeartbeatInterval is how often peers refresh tracker registration
 	TrackerHeartbeatInterval = 2 * time.Minute
 
 	// TrackerRefreshInterval is how often peers fetch tracker peer lists
-	TrackerRefreshInterval = 2 * time.Minute
+	TrackerRefreshInterval = 30 * time.Second
 
 	// TrackerRetryInitialDelay is the starting backoff delay for tracker retries
-	TrackerRetryInitialDelay = 1 * time.Second
+	TrackerRetryInitialDelay = 250 * time.Millisecond
 
 	// TrackerRetryMaxDelay is the max backoff delay for tracker retries
-	TrackerRetryMaxDelay = 30 * time.Second
+	TrackerRetryMaxDelay = 10 * time.Second
+
+	// DHTBootstrapThrottle is the minimum interval between DHT bootstrap calls
+	DHTBootstrapThrottle = 30 * time.Second
+
+	// DHTBootstrapPeerThreshold is the number of new peers needed to trigger bootstrap
+	DHTBootstrapPeerThreshold = 5
 )
 
 // Tracker Authentication
 const (
-	// AuthTokenLength is the expected length of auth tokens
-	AuthTokenLength = 32
-
 	// TokenExpiration is how long auth tokens are valid
 	TokenExpiration = 24 * time.Hour
+
+	// TokenRefreshThreshold is how long before expiration to refresh the token
+	TokenRefreshThreshold = 1 * time.Hour
+
+	// TokenFutureTolerance is the max allowed clock skew (tokens issued in the future)
+	TokenFutureTolerance = 60 * time.Second
 
 	// EnvAuthKey is the environment variable name for tracker auth key(s)
 	// Supports multiple keys comma-separated
@@ -93,6 +105,9 @@ const (
 	// HTTPClientTimeout is the timeout for HTTP client requests
 	HTTPClientTimeout = 10 * time.Second
 
+	// RPCTimeout is the timeout for RPC calls
+	RPCTimeout = 10 * time.Second
+
 	// TransferIdleTimeout is the max idle time for a transfer stream
 	TransferIdleTimeout = 30 * time.Second
 
@@ -109,19 +124,16 @@ const (
 	ProtocolID = "/raag/1.0.0"
 
 	// ShareProtocolID is the framed transfer protocol identifier for Raag
-	ShareProtocolID = "/raag/share/2.0.0"
+	ShareProtocolID = "/raag/share/1.0.0"
 
-	// PingProtocolID is the ping/presence protocol identifier for Raag
-	PingProtocolID = "/raag/ping/1.0.0"
+	// PresenceProtocolID is for peer presence notifications
+	PresenceProtocolID = "/raag/presence/1.0.0"
 
 	// ProtocolVersion indicates the protocol version
 	ProtocolVersion = "1.0.0"
 
 	// ShareProtocolVersion indicates the framed transfer protocol version
-	ShareProtocolVersion = "2.0.0"
-
-	// PingProtocolVersion indicates the ping protocol version
-	PingProtocolVersion = "1.0.0"
+	ShareProtocolVersion = "1.0.0"
 )
 
 // Playback

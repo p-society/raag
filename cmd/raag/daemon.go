@@ -5,11 +5,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"github.com/p-society/raag/app"
 	"github.com/p-society/raag/internal/config"
 	"github.com/p-society/raag/internal/logger"
-	"github.com/p-society/raag/internal/tui"
+	"github.com/p-society/raag/rpc"
 	"github.com/spf13/cobra"
 )
 
@@ -31,15 +31,12 @@ Examples:
 			runDaemon(cmd)
 		},
 	}
-
 	cmd.Flags().StringVar(&daemonTrackerURL, "tracker", "", "Tracker URL")
 	return cmd
 }
 
 func runDaemon(cmd *cobra.Command) {
 	logger.Infof("starting Raag daemon")
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	v, err := config.InitViper(cmd)
 	if err != nil {
 		logger.Errorf("failed to initialize config error=%v", err)
@@ -51,64 +48,51 @@ func runDaemon(cmd *cobra.Command) {
 		logger.Errorf("failed to load config error=%v", err)
 		os.Exit(1)
 	}
+	if logLevel, _ := cmd.Flags().GetString("log-level"); logLevel == "" {
+		logger.SetLevel(cfg.LogLevel)
+	}
 	if daemonTrackerURL != "" {
 		cfg.TrackerURL = daemonTrackerURL
-		if err := config.SaveConfig(v, cfg); err != nil {
-			logger.Warnf("failed to save tracker URL to config error=%v", err)
-		} else {
-			logger.Infof("saved tracker URL to config url=%s", daemonTrackerURL)
-		}
+		config.SaveConfig(v, cfg)
 	}
 
-	logger.SetLevel(cfg.LogLevel)
-	rt, err := bootstrapRuntime(cmd)
+	a, err := app.NewApp(v, cfg)
 	if err != nil {
-		logger.Errorf("failed to bootstrap runtime error=%v", err)
+		logger.Errorf("failed to create app error=%v", err)
 		os.Exit(1)
 	}
 
-	applyRuntime(rt)
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		if err := netMgr.Start(ctx); err != nil {
-			if err == context.Canceled {
-				logger.Infof("network stopped")
-				return
-			}
-			logger.Errorf("network error error=%v", err)
-		}
-	}()
+	defer cancel()
 
-	socketServer := NewSocketServer(netMgr)
-	if err := socketServer.Start(); err != nil {
-		logger.Errorf("failed to start socket server error=%v", err)
+	a.StartNetwork(ctx)
+	rpcServer := rpc.NewServer(config.SocketPath(), a, func() {
+		cancel()
+	})
+	if err := rpcServer.Start(); err != nil {
+		logger.Errorf("failed to start RPC server error=%v", err)
 		os.Exit(1)
 	}
 
 	logger.Infof("Raag daemon started. Use Ctrl+C to stop.")
-	showTUI := shouldStartTUI(cmd)
-	if showTUI {
-		go func() {
-			tui.Start(lib, p, netMgr, pm)
-			cancel()
-		}()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-sigCh:
+		logger.Infof("received termination signal")
+	case <-rpcServer.ShutdownRequested():
+		logger.Infof("shutdown requested via RPC")
+	case <-ctx.Done():
+		logger.Infof("shutdown requested via RPC")
 	}
 
-	<-sigCh
 	logger.Infof("shutting down daemon")
-	if netMgr != nil {
-		netMgr.SendGoodbyeToAll()
-		time.Sleep(500 * time.Millisecond)
+	rpcServer.Stop()
+	if err := a.NetMgr.Close(); err != nil {
+		logger.Warnf("failed to close network manager error=%v", err)
 	}
 
-	socketServer.Stop()
-	cancel()
-	if netMgr != nil {
-		if err := netMgr.Close(); err != nil {
-			logger.Warnf("failed to close network manager error=%v", err)
-		}
-	}
-
-	time.Sleep(1 * time.Second)
+	a.SaveState()
 	logger.Infof("daemon stopped")
 }

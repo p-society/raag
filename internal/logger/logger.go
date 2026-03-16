@@ -1,28 +1,14 @@
 package logger
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
-	"sync"
-	"time"
 
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
 )
 
-var (
-	logger    *log.Logger
-	jsonMode  bool
-	jsonMutex sync.RWMutex
-)
-
-type JSONLogEntry struct {
-	Timestamp string `json:"timestamp"`
-	Level     string `json:"level"`
-	Message   string `json:"message"`
-}
+var logger *log.Logger
 
 func init() {
 	NewLogger("raag")
@@ -57,10 +43,6 @@ func NewLogger(prefix string) {
 }
 
 func SetLevel(level string) {
-	if logger == nil {
-		NewLogger("raag")
-	}
-
 	switch strings.ToLower(level) {
 	case "debug":
 		logger.SetLevel(log.DebugLevel)
@@ -75,67 +57,47 @@ func SetLevel(level string) {
 	}
 }
 
+// SetJSONMode switches between text and JSON output using charm.land/log's native formatter.
 func SetJSONMode(enabled bool) {
-	jsonMutex.Lock()
-	defer jsonMutex.Unlock()
-	jsonMode = enabled
-}
-
-func IsJSONMode() bool {
-	jsonMutex.RLock()
-	defer jsonMutex.RUnlock()
-	return jsonMode
+	if enabled {
+		logger.SetFormatter(log.JSONFormatter)
+	} else {
+		logger.SetFormatter(log.TextFormatter)
+	}
 }
 
 func With(args ...any) *log.Logger {
 	return logger.With(args...)
 }
 
+func Debug(msg string, args ...any) {
+	logger.Debug(msg, args...)
+}
+
+func Info(msg string, args ...any) {
+	logger.Info(msg, args...)
+}
+
+func Warn(msg string, args ...any) {
+	logger.Warn(msg, args...)
+}
+
+func Error(msg string, args ...any) {
+	logger.Error(msg, args...)
+}
+
 func Debugf(format string, args ...any) {
-	logJSON(log.DebugLevel, "DEBUG", format, args...)
+	logger.Debugf(format, args...)
 }
 
 func Infof(format string, args ...any) {
-	logJSON(log.InfoLevel, "INFO", format, args...)
+	logger.Infof(format, args...)
 }
 
 func Warnf(format string, args ...any) {
-	logJSON(log.WarnLevel, "WARN", format, args...)
+	logger.Warnf(format, args...)
 }
 
 func Errorf(format string, args ...any) {
-	logJSON(log.ErrorLevel, "ERROR", format, args...)
-}
-
-func logJSON(level log.Level, levelStr, format string, args ...any) {
-	jsonMutex.RLock()
-	isJSON := jsonMode
-	jsonMutex.RUnlock()
-
-	if isJSON {
-		msg := format
-		if len(args) > 0 {
-			msg = fmt.Sprintf(format, args...)
-		}
-
-		entry := JSONLogEntry{
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Level:     levelStr,
-			Message:   msg,
-		}
-		jsonBytes, _ := json.Marshal(entry)
-		os.Stderr.Write(append(jsonBytes, '\n'))
-		return
-	}
-
-	switch level {
-	case log.DebugLevel:
-		logger.Debugf(format, args...)
-	case log.InfoLevel:
-		logger.Infof(format, args...)
-	case log.WarnLevel:
-		logger.Warnf(format, args...)
-	case log.ErrorLevel:
-		logger.Errorf(format, args...)
-	}
+	logger.Errorf(format, args...)
 }

@@ -2,11 +2,13 @@ package network
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,8 +22,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
-	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/p-society/raag/internal/auth"
 	"github.com/p-society/raag/internal/config"
 	"github.com/p-society/raag/internal/constants"
 	"github.com/p-society/raag/internal/discovery"
@@ -30,6 +32,15 @@ import (
 	"github.com/p-society/raag/internal/metadata"
 	"github.com/spf13/viper"
 )
+
+func generateSessionNonce() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		nonce := time.Now().UnixNano()
+		return fmt.Sprintf("%d", nonce)
+	}
+	return hex.EncodeToString(bytes)
+}
 
 type serializedKey struct {
 	Type string `json:"type"`
@@ -110,19 +121,53 @@ func generateAndSaveKey(keyPath string) (crypto.PrivKey, error) {
 	return key, nil
 }
 
+type idleTimeoutWriter struct {
+	stream  network.Stream
+	timeout time.Duration
+}
+
+func (w *idleTimeoutWriter) Write(p []byte) (int, error) {
+	w.stream.SetWriteDeadline(time.Now().Add(w.timeout))
+	return w.stream.Write(p)
+}
+
+type idleTimeoutReader struct {
+	stream  network.Stream
+	timeout time.Duration
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	r.stream.SetReadDeadline(time.Now().Add(r.timeout))
+	return r.stream.Read(p)
+}
+
 type NetworkManager struct {
-	host          host.Host
-	cfg           *config.Config
-	viper         *viper.Viper
-	library       *library.Library
-	musicDir      string
-	peers         map[peer.ID]struct{}
-	peersLock     sync.RWMutex
-	Online        bool
-	OnPeerJoin    func(peer.ID)
-	OnPeerLeave   func(peer.ID)
-	OnStateChange func(bool)
-	discovery     *discovery.Manager
+	host            host.Host
+	ctx             context.Context
+	cfg             *config.Config
+	viper           *viper.Viper
+	library         *library.Library
+	musicDir        string
+	Online          bool
+	OnPeerJoin      func(peer.ID)
+	OnPeerLeave     func(peer.ID)
+	OnStateChange   func(bool)
+	discovery       *discovery.Manager
+	authEnabled     bool
+	authorizedPeers map[string]struct{}
+	authorizedMu    sync.RWMutex
+	usedNonces      map[string]time.Time
+	nonceMu         sync.Mutex
+	peerStateMu     sync.RWMutex
+	connectedPeers  map[peer.ID]bool
+	peerConnectCh   chan struct{}
+}
+
+func (n *NetworkManager) getContext() context.Context {
+	if n.ctx != nil {
+		return n.ctx
+	}
+	return context.Background()
 }
 
 func (n *NetworkManager) Host() host.Host {
@@ -134,6 +179,114 @@ func (n *NetworkManager) Close() error {
 		return nil
 	}
 	return n.host.Close()
+}
+
+func (n *NetworkManager) SetAuthEnabled(enabled bool) {
+	n.authorizedMu.Lock()
+	defer n.authorizedMu.Unlock()
+	n.authEnabled = enabled
+	if enabled {
+		n.authorizedPeers = make(map[string]struct{})
+		logger.Infof("P2P authentication enabled")
+	} else {
+		n.authorizedPeers = nil
+		logger.Infof("P2P authentication disabled")
+	}
+}
+
+func (n *NetworkManager) AuthorizePeer(peerID peer.ID) {
+	n.authorizedMu.Lock()
+	defer n.authorizedMu.Unlock()
+	if n.authorizedPeers != nil {
+		n.authorizedPeers[peerID.String()] = struct{}{}
+		logger.Debugf("Peer authorized: %s", peerID)
+	}
+}
+
+func (n *NetworkManager) IsPeerAuthorized(peerID peer.ID) bool {
+	n.authorizedMu.RLock()
+	defer n.authorizedMu.RUnlock()
+	if !n.authEnabled {
+		return true
+	}
+	if n.authorizedPeers == nil {
+		return false
+	}
+	_, authorized := n.authorizedPeers[peerID.String()]
+	return authorized
+}
+
+func (n *NetworkManager) GetAuthData() (string, error) {
+	if n.discovery != nil {
+		return n.discovery.GetAuthData()
+	}
+	return "", fmt.Errorf("discovery manager not available")
+}
+
+func (n *NetworkManager) IsAuthEnabled() bool {
+	n.authorizedMu.RLock()
+	defer n.authorizedMu.RUnlock()
+	return n.authEnabled
+}
+
+func (n *NetworkManager) VerifyAuthToken(tokenData string, expectedPeerID string, sessionNonce string) error {
+	if tokenData == "" {
+		if n.IsAuthEnabled() {
+			return fmt.Errorf("authentication required but no token provided")
+		}
+		return nil
+	}
+
+	token, err := auth.DeserializeToken(tokenData)
+	if err != nil {
+		return fmt.Errorf("invalid token format: %w", err)
+	}
+
+	if expectedPeerID != "" && token.PeerID != expectedPeerID {
+		return fmt.Errorf("peer ID mismatch: token is for %s, expected %s", token.PeerID, expectedPeerID)
+	}
+
+	if err := n.verifyNonceUsed(sessionNonce); err != nil {
+		return err
+	}
+
+	valid, err := auth.VerifyToken(token)
+	if err != nil {
+		return fmt.Errorf("token verification failed: %w", err)
+	}
+	if !valid {
+		return fmt.Errorf("token verification failed")
+	}
+
+	return nil
+}
+
+func (n *NetworkManager) verifyNonceUsed(nonce string) error {
+	if nonce == "" {
+		return nil
+	}
+
+	n.nonceMu.Lock()
+	defer n.nonceMu.Unlock()
+
+	if n.usedNonces == nil {
+		n.usedNonces = make(map[string]time.Time)
+	}
+
+	if _, exists := n.usedNonces[nonce]; exists {
+		return fmt.Errorf("replay attack detected: nonce already used")
+	}
+
+	n.usedNonces[nonce] = time.Now()
+
+	go func() {
+		time.Sleep(5 * time.Minute)
+		n.nonceMu.Lock()
+		delete(n.usedNonces, nonce)
+		n.nonceMu.Unlock()
+	}()
+
+	return nil
 }
 
 func NewNetwork(cfg *config.Config, v *viper.Viper, lib *library.Library, musicDir string) (*NetworkManager, error) {
@@ -171,14 +324,10 @@ func newNetworkWithIdentity(cfg *config.Config, v *viper.Viper, lib *library.Lib
 		opts = append(opts, libp2p.EnableHolePunching())
 		opts = append(opts, libp2p.NATPortMap())
 		opts = append(opts, libp2p.EnableNATService())
-		low, high := connectionWatermarks(cfg.MaxPeers)
-		opts = append(opts, libp2p.ConnectionManager(NewConnectionManager(low, high, 2*time.Minute)))
 		logger.Debugf("NAT traversal enabled: circuit relay, hole punching, UPnP, AutoNAT")
 	} else {
 		logger.Debugf("Using offline mode with limited transports")
 		opts = append(opts, libp2p.DefaultTransports)
-		low, high := connectionWatermarks(15)
-		opts = append(opts, libp2p.ConnectionManager(NewConnectionManager(low, high, time.Minute)))
 	}
 
 	host, err := libp2p.New(opts...)
@@ -196,15 +345,25 @@ func newNetworkWithIdentity(cfg *config.Config, v *viper.Viper, lib *library.Lib
 		logger.Warnf("Failed to marshal identity key: %v", err)
 	}
 
-	discoveryMgr := discovery.NewManager(host, identityKeyBytes, cfg.TrackerURL, maxPeers, cfg.Host, cfg.Rendezvous, cfg.DHTEnabled, cfg.BootstrapPeers)
+	discoveryMgr := discovery.NewManager(discovery.ManagerConfig{
+		Host:             host,
+		IdentityKeyBytes: identityKeyBytes,
+		AuthSecret:       cfg.AuthSecret,
+		TrackerURL:       cfg.TrackerURL,
+		MaxPeers:         maxPeers,
+		ListenHost:       cfg.Host,
+		Rendezvous:       cfg.Rendezvous,
+		DHTEnabled:       cfg.DHTEnabled,
+		BootstrapPeers:   cfg.BootstrapPeers,
+	})
 	nm := &NetworkManager{
-		host:      host,
-		cfg:       cfg,
-		viper:     v,
-		library:   lib,
-		musicDir:  musicDir,
-		peers:     make(map[peer.ID]struct{}),
-		discovery: discoveryMgr,
+		host:          host,
+		cfg:           cfg,
+		viper:         v,
+		library:       lib,
+		musicDir:      musicDir,
+		discovery:     discoveryMgr,
+		peerConnectCh: make(chan struct{}, 1),
 	}
 
 	discoveryMgr.SetNetworkManager(nm)
@@ -220,32 +379,16 @@ func newNetworkWithIdentity(cfg *config.Config, v *viper.Viper, lib *library.Lib
 	return nm, nil
 }
 
-func NewConnectionManager(low, high int, gracePeriod time.Duration) *connmgr.BasicConnMgr {
-	cm, _ := connmgr.NewConnManager(low, high, connmgr.WithGracePeriod(gracePeriod))
-	return cm
-}
-
-func connectionWatermarks(maxPeers int) (int, int) {
-	if maxPeers <= 0 {
-		maxPeers = constants.DefaultMaxPeers
-	}
-
-	high := maxPeers
-	low := int(math.Max(5, float64(high/2)))
-	if low >= high {
-		low = max(1, high-1)
-	}
-	return low, high
-}
-
 func newResourceManager() (network.ResourceManager, error) {
 	limiter := rcmgr.DefaultLimits.AutoScale()
 	return rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(limiter))
 }
 
 func (n *NetworkManager) Start(ctx context.Context) error {
+	n.ctx = ctx
+	n.connectedPeers = make(map[peer.ID]bool)
 	n.host.SetStreamHandler(protocol.ID(constants.ShareProtocolID), n.handleStream)
-	n.host.SetStreamHandler(protocol.ID(constants.PingProtocolID), n.handlePingStream)
+	n.host.SetStreamHandler(protocol.ID(constants.PresenceProtocolID), n.handlePresence)
 	if err := n.discovery.Start(ctx); err != nil {
 		logger.Errorf("Discovery failed to start error=%v", err)
 	}
@@ -270,56 +413,41 @@ func (n *NetworkManager) Start(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// withPeersLock executes the given function with the peers lock held for reading
-func (n *NetworkManager) withPeersLock(fn func(map[peer.ID]struct{})) {
-	n.peersLock.RLock()
-	defer n.peersLock.RUnlock()
-	fn(n.peers)
-}
-
 // GetPeers returns information about currently connected peers
 func (n *NetworkManager) GetPeers() []peer.AddrInfo {
-	peers := make([]peer.AddrInfo, 0)
-	n.withPeersLock(func(peersMap map[peer.ID]struct{}) {
-		for peerID := range peersMap {
-			if conns := n.host.Network().ConnsToPeer(peerID); len(conns) > 0 {
-				peers = append(peers, peer.AddrInfo{
-					ID:    peerID,
-					Addrs: []multiaddr.Multiaddr{conns[0].RemoteMultiaddr()},
-				})
-			}
+	peerIDs := n.host.Network().Peers()
+	peers := make([]peer.AddrInfo, 0, len(peerIDs))
+	for _, peerID := range peerIDs {
+		if conns := n.host.Network().ConnsToPeer(peerID); len(conns) > 0 {
+			peers = append(peers, peer.AddrInfo{
+				ID:    peerID,
+				Addrs: []multiaddr.Multiaddr{conns[0].RemoteMultiaddr()},
+			})
 		}
-	})
+	}
 	return peers
 }
 
 // IsOnline returns true if there are any known peers
 func (n *NetworkManager) IsOnline() bool {
-	var isOnline bool
-	n.withPeersLock(func(peersMap map[peer.ID]struct{}) {
-		isOnline = len(peersMap) > 0
-	})
-	return isOnline
+	return len(n.host.Network().Peers()) > 0
 }
 
 // GetPeerCount returns the number of known peers
 func (n *NetworkManager) GetPeerCount() int {
-	var count int
-	n.withPeersLock(func(peersMap map[peer.ID]struct{}) {
-		count = len(peersMap)
-	})
-	return count
+	return len(n.host.Network().Peers())
 }
 
 func (n *NetworkManager) WaitForPeers(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if n.IsOnline() {
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
+	if n.IsOnline() {
+		return true
 	}
-	return n.IsOnline()
+	select {
+	case <-n.peerConnectCh:
+		return n.IsOnline()
+	case <-time.After(timeout):
+		return n.IsOnline()
+	}
 }
 
 func (n *NetworkManager) Connect(ctx context.Context, addrInfo peer.AddrInfo) error {
@@ -327,13 +455,7 @@ func (n *NetworkManager) Connect(ctx context.Context, addrInfo peer.AddrInfo) er
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
-	logger.Debugf("Connecting to peer peer_id=%s", addrInfo.ID)
-	go func() {
-		if err := n.SendHelloToPeer(ctx, addrInfo.ID); err != nil {
-			logger.Debugf("Auto-hello failed for peer peer_id=%s error=%v", addrInfo.ID, err)
-		}
-	}()
-
+	logger.Debugf("Connected to peer peer_id=%s", addrInfo.ID)
 	if n.discovery != nil {
 		n.discovery.RefreshTrackerRegistration(ctx)
 	}
@@ -341,26 +463,11 @@ func (n *NetworkManager) Connect(ctx context.Context, addrInfo peer.AddrInfo) er
 }
 
 func (n *NetworkManager) Disconnect(peerID peer.ID) error {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := n.SendGoodbye(ctx, peerID); err != nil {
-			logger.Infof("Goodbye sent or failed peer_id=%s error=%v", peerID, err)
-		}
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-
 	if err := n.host.Network().ClosePeer(peerID); err != nil {
 		return fmt.Errorf("failed to disconnect: %w", err)
 	}
 
-	n.peersLock.Lock()
-	delete(n.peers, peerID)
-	n.peersLock.Unlock()
-
 	logger.Infof("Disconnected from peer peer_id=%s", peerID)
-	logger.Infof("Peer %s has left the network", peerID)
 	return nil
 }
 
@@ -373,7 +480,6 @@ func (n *NetworkManager) GetMultiaddr() string {
 	if len(addrs) == 0 {
 		return fmt.Sprintf("/p2p/%s", n.host.ID())
 	}
-
 	for _, addr := range addrs {
 		if isUsableAddr(addr.String()) {
 			return fmt.Sprintf("%s/p2p/%s", addr, n.host.ID())
@@ -385,7 +491,30 @@ func (n *NetworkManager) GetMultiaddr() string {
 }
 
 func isUsableAddr(addr string) bool {
-	return !strings.Contains(addr, "/127.0.0.1/") && !strings.Contains(addr, "/0.0.0.0/")
+	ma, err := multiaddr.NewMultiaddr(addr)
+	if err != nil {
+		return false
+	}
+
+	protocols := ma.Protocols()
+	for _, p := range protocols {
+		if p.Code == multiaddr.P_IP4 || p.Code == multiaddr.P_IP6 {
+			comp, err := ma.ValueForProtocol(p.Code)
+			if err != nil {
+				continue
+			}
+
+			ip, err := netip.ParseAddr(comp)
+			if err != nil {
+				continue
+			}
+			if ip.IsLoopback() || ip.IsUnspecified() {
+				return false
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func (n *NetworkManager) GetAllKnownPeers() []peer.AddrInfo {
@@ -415,21 +544,10 @@ func (n *NetworkManager) GetAuthPublicKey() string {
 	return n.discovery.GetAuthPublicKey()
 }
 
-func (n *NetworkManager) SetDiscoveryTestIntervals(heartbeat, refresh, retryDelay, maxRetryDelay time.Duration) {
-	if n.discovery == nil {
-		return
-	}
-	n.discovery.SetTestIntervals(heartbeat, refresh, retryDelay, maxRetryDelay)
-}
-
 func (n *NetworkManager) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) error {
 	logger.Debugf("ShareSong function called peer_info=%v song=%v", peerInfo, song)
-	digest, fileSize, err := hashFile(song.Path)
-	if err != nil {
-		return fmt.Errorf("prepare transfer: %w", err)
-	}
-	if fileSize > constants.TransferMaxFileSize {
-		return fmt.Errorf("file exceeds max transfer size: %d", fileSize)
+	if song.Size > constants.TransferMaxFileSize {
+		return fmt.Errorf("file exceeds max transfer size: %d", song.Size)
 	}
 
 	file, err := os.Open(song.Path)
@@ -438,21 +556,23 @@ func (n *NetworkManager) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) 
 	}
 	defer file.Close()
 
-	stream, err := n.host.NewStream(context.Background(), peerInfo.ID, protocol.ID(constants.ShareProtocolID))
+	ctx, cancel := context.WithTimeout(n.getContext(), 10*time.Second)
+	defer cancel()
+	stream, err := n.host.NewStream(ctx, peerInfo.ID, protocol.ID(constants.ShareProtocolID))
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 	defer stream.Close()
 
-	meta := buildTransferMetadata(song, fileSize, digest)
+	authToken, _ := n.GetAuthData()
+	sessionNonce := generateSessionNonce()
+	meta := buildTransferMetadata(song, song.Size, song.Hash, authToken, sessionNonce)
 	if err := writeTransferMetadata(stream, meta); err != nil {
 		stream.Reset()
 		return fmt.Errorf("failed to send transfer metadata: %w", err)
 	}
-	if err := stream.SetWriteDeadline(time.Now().Add(constants.TransferIdleTimeout)); err != nil {
-		logger.Debugf("failed to set write deadline error=%v", err)
-	}
-	if _, err := io.Copy(stream, file); err != nil {
+	writer := &idleTimeoutWriter{stream: stream, timeout: constants.TransferIdleTimeout}
+	if _, err := io.Copy(writer, file); err != nil {
 		stream.Reset()
 		return fmt.Errorf("failed to send song data: %w", err)
 	}
@@ -464,6 +584,7 @@ func (n *NetworkManager) ShareSong(peerInfo *peer.AddrInfo, song metadata.Song) 
 func (n *NetworkManager) handleStream(stream network.Stream) {
 	peerID := stream.Conn().RemotePeer()
 	logger.Debugf("handleStream called peer_id=%s", peerID)
+
 	meta, err := readTransferMetadata(stream)
 	if err != nil {
 		stream.Reset()
@@ -471,6 +592,12 @@ func (n *NetworkManager) handleStream(stream network.Stream) {
 		return
 	}
 	defer stream.Close()
+
+	if err := n.VerifyAuthToken(meta.AuthToken, peerID.String(), meta.SessionNonce); err != nil {
+		stream.Reset()
+		logger.Warnf("Auth verification failed for peer peer_id=%s error=%v", peerID, err)
+		return
+	}
 
 	if meta.SizeBytes == 0 {
 		logger.Debugf("Received empty file transfer from peer peer_id=%s", peerID)
@@ -516,13 +643,10 @@ func (n *NetworkManager) handleStream(stream network.Stream) {
 	}()
 
 	logger.Debugf("Preparing to save file file_path=%s", filePath)
-	if err := stream.SetReadDeadline(time.Now().Add(constants.TransferIdleTimeout)); err != nil {
-		logger.Debugf("failed to set read deadline error=%v", err)
-	}
-
 	hasher := sha256.New()
 	writer := io.MultiWriter(tmpFile, hasher)
-	bytesWritten, err := io.CopyN(writer, stream, meta.SizeBytes)
+	reader := &idleTimeoutReader{stream: stream, timeout: constants.TransferIdleTimeout}
+	bytesWritten, err := io.CopyN(writer, reader, meta.SizeBytes)
 	if err != nil {
 		stream.Reset()
 		logger.Errorf("Error saving song error=%v", err)
@@ -576,24 +700,25 @@ func (n *NetworkManager) NotifyPeerConnected(peerID peer.ID, addr string) {
 }
 
 func (n *NetworkManager) notifyPeerConnected(peerID peer.ID, addr string) {
-	n.peersLock.Lock()
-	defer n.peersLock.Unlock()
-
 	if peerID == n.host.ID() {
 		return
 	}
-	if _, ok := n.peers[peerID]; !ok {
-		n.peers[peerID] = struct{}{}
-		logger.Infof("Peer connected peer_id=%s address=%s", peerID, addr)
-		if n.discovery != nil {
-			n.discovery.MarkPeerConnected(peerID)
-		}
 
-		go func() {
-			if err := n.SendHelloToPeer(context.Background(), peerID); err != nil {
-				logger.Debugf("Auto-hello failed for peer peer_id=%s error=%v", peerID, err)
+	n.peerStateMu.Lock()
+	_, alreadyConnected := n.connectedPeers[peerID]
+	n.connectedPeers[peerID] = true
+	n.peerStateMu.Unlock()
+
+	conns := n.host.Network().ConnsToPeer(peerID)
+	if len(conns) == 1 {
+		if !alreadyConnected {
+			logger.Infof("Peer connected peer_id=%s address=%s", peerID, addr)
+			n.broadcastPresence(peerID, "online")
+			select {
+			case n.peerConnectCh <- struct{}{}:
+			default:
 			}
-		}()
+		}
 		if n.OnPeerJoin != nil {
 			n.OnPeerJoin(peerID)
 		}
@@ -608,36 +733,102 @@ func (n *NetworkManager) notifyPeerConnected(peerID peer.ID, addr string) {
 }
 
 func (n *NetworkManager) handlePeerDisconnect(peerID peer.ID, addr multiaddr.Multiaddr) {
-	n.peersLock.Lock()
-	_, peerInMap := n.peers[peerID]
-	delete(n.peers, peerID)
-	peerCount := len(n.peers)
-	n.peersLock.Unlock()
-
+	conns := n.host.Network().ConnsToPeer(peerID)
 	logger.Infof("Peer has disconnected peer_id=%s address=%s", peerID, addr.String())
-	if peerInMap {
-		logger.Infof("Peer %s has left the network", peerID)
+
+	n.peerStateMu.Lock()
+	if n.connectedPeers[peerID] {
+		delete(n.connectedPeers, peerID)
+		n.peerStateMu.Unlock()
+		n.broadcastPresence(peerID, "offline")
+	} else {
+		n.peerStateMu.Unlock()
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := n.SendGoodbye(ctx, peerID); err != nil {
-			logger.Debugf("Goodbye send result peer_id=%s error=%v", peerID, err)
-		}
-	}()
-
-	if peerCount == 0 {
-		n.peersLock.Lock()
-		n.Online = false
-		n.peersLock.Unlock()
-		logger.Infof("Network: Offline - no peers connected")
+	if len(conns) == 0 {
 		if n.OnPeerLeave != nil {
 			n.OnPeerLeave(peerID)
 		}
-		if n.OnStateChange != nil {
-			n.OnStateChange(false)
+
+		peerCount := len(n.host.Network().Peers())
+		if peerCount == 0 {
+			n.Online = false
+			logger.Infof("Network: Offline - no peers connected")
+			if n.OnStateChange != nil {
+				n.OnStateChange(false)
+			}
 		}
+	}
+}
+
+func (n *NetworkManager) handlePresence(stream network.Stream) {
+	peerID := stream.Conn().RemotePeer()
+	logger.Debugf("Received presence message from peer_id=%s", peerID)
+
+	buf := make([]byte, 64)
+	nRead, err := stream.Read(buf)
+	if err != nil || nRead == 0 {
+		stream.Close()
+		return
+	}
+
+	msg := string(buf[:nRead])
+	if len(msg) < 2 {
+		stream.Close()
+		return
+	}
+
+	peerIDStr := msg[1:]
+	action := msg[:1]
+	switch action {
+	case "o":
+		logger.Infof("Peer is online peer_id=%s", peerIDStr)
+	case "x":
+		logger.Infof("Peer went offline peer_id=%s", peerIDStr)
+	}
+	stream.Close()
+}
+
+func (n *NetworkManager) broadcastPresence(peerID peer.ID, status string) {
+	n.peerStateMu.RLock()
+	peers := make([]peer.ID, 0, len(n.connectedPeers))
+	for p := range n.connectedPeers {
+		if p != n.host.ID() {
+			peers = append(peers, p)
+		}
+	}
+	n.peerStateMu.RUnlock()
+
+	if len(peers) == 0 {
+		logger.Debugf("No peers to broadcast presence to")
+		return
+	}
+
+	msg := ""
+	if status == "online" {
+		msg = "o" + peerID.String()
+	} else {
+		msg = "x" + peerID.String()
+	}
+
+	logger.Debugf("Broadcasting presence: %s to %d peers", status, len(peers))
+	for _, p := range peers {
+		go func(target peer.ID) {
+			ctx, cancel := context.WithTimeout(n.getContext(), 5*time.Second)
+			defer cancel()
+
+			stream, err := n.host.NewStream(ctx, target, protocol.ID(constants.PresenceProtocolID))
+			if err != nil {
+				logger.Debugf("Failed to send presence to peer_id=%s error=%v", target, err)
+				return
+			}
+			defer stream.Close()
+
+			_, err = stream.Write([]byte(msg))
+			if err != nil {
+				logger.Debugf("Failed to write presence to peer_id=%s error=%v", target, err)
+			}
+		}(p)
 	}
 }
 
@@ -659,145 +850,4 @@ func (n *NetworkManager) AddBootstrapPeer(ctx context.Context, multiaddrStr stri
 		return fmt.Errorf("invalid multiaddress: %w", err)
 	}
 	return n.discovery.AddBootstrapPeer(ctx, *peerAddr)
-}
-
-// SendPing sends a hello message to the specified peer
-func (n *NetworkManager) SendPing(ctx context.Context, peerID peer.ID) error {
-	stream, err := n.host.NewStream(ctx, peerID, protocol.ID(constants.PingProtocolID))
-	if err != nil {
-		return fmt.Errorf("failed to open ping stream: %w", err)
-	}
-	defer stream.Close()
-
-	pingMsg := BuildPingMessage(n.host.ID().String(), PingTypeHello, "")
-	if err := WritePingMessage(stream, pingMsg); err != nil {
-		return fmt.Errorf("failed to send ping: %w", err)
-	}
-
-	logger.Infof("Sent hello to peer peer_id=%s", peerID)
-	pongMsg, err := ReadPingMessage(stream)
-	if err != nil {
-		logger.Warnf("Did not receive pong from peer peer_id=%s error=%v", peerID, err)
-		return fmt.Errorf("failed to receive pong: %w", err)
-	}
-	if pongMsg.Type == PingTypePong {
-		logger.Infof("Received pong from peer peer_id=%s", peerID)
-		logger.Infof("Peer %s is online!", peerID)
-		if pongMsg.TTL > 0 {
-			n.floodMessage(pingMsg, peerID)
-		}
-	}
-	return nil
-}
-
-// SendHelloToPeer sends automatic hello when connecting to a peer
-func (n *NetworkManager) SendHelloToPeer(ctx context.Context, peerID peer.ID) error {
-	return n.SendPing(ctx, peerID)
-}
-
-// SendGoodbye sends a "left" message to a peer before disconnecting
-func (n *NetworkManager) SendGoodbye(ctx context.Context, peerID peer.ID) error {
-	stream, err := n.host.NewStream(ctx, peerID, protocol.ID(constants.PingProtocolID))
-	if err != nil {
-		return fmt.Errorf("failed to open goodbye stream: %w", err)
-	}
-	defer stream.Close()
-
-	goodbyeMsg := BuildPingMessage(n.host.ID().String(), PingTypeLeft, "goodbye")
-	if err := WritePingMessage(stream, goodbyeMsg); err != nil {
-		return fmt.Errorf("failed to send goodbye: %w", err)
-	}
-
-	logger.Infof("Sent goodbye to peer peer_id=%s", peerID)
-	if goodbyeMsg.TTL > 0 {
-		n.floodMessage(goodbyeMsg, peerID)
-	}
-	return nil
-}
-
-// SendGoodbyeToAll sends goodbye to all connected peers
-func (n *NetworkManager) SendGoodbyeToAll() {
-	peers := n.GetPeers()
-	if len(peers) == 0 {
-		return
-	}
-
-	logger.Infof("Sending goodbye to all peers count=%d", len(peers))
-	for _, p := range peers {
-		go func(peerID peer.ID) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := n.SendGoodbye(ctx, peerID); err != nil {
-				logger.Debugf("Goodbye to peer peer_id=%s error=%v", peerID, err)
-			}
-		}(p.ID)
-	}
-}
-
-// handlePingStream handles incoming ping/presence messages
-func (n *NetworkManager) handlePingStream(stream network.Stream) {
-	pingMsg, err := ReadPingMessage(stream)
-	if err != nil {
-		logger.Warnf("Failed to read ping message from peer peer_id=%s error=%v", stream.Conn().RemotePeer(), err)
-		stream.Reset()
-		return
-	}
-
-	senderPeerID := stream.Conn().RemotePeer()
-	logger.Debugf("Received ping message type=%s from peer peer_id=%s origin_id=%s ttl=%d",
-		pingMsg.Type, pingMsg.PeerID, pingMsg.OriginID, pingMsg.TTL)
-
-	switch pingMsg.Type {
-	case PingTypeHello:
-		logger.Infof("Peer %s is connected!", pingMsg.PeerID)
-		pongMsg := BuildPingMessage(n.host.ID().String(), PingTypePong, "pong")
-		if err := WritePingMessage(stream, pongMsg); err != nil {
-			logger.Warnf("Failed to send pong to peer peer_id=%s error=%v", senderPeerID, err)
-			stream.Reset()
-			return
-		}
-
-		logger.Infof("Sent pong to peer peer_id=%s", senderPeerID)
-		if pingMsg.TTL > 0 {
-			n.floodMessage(pingMsg, senderPeerID)
-		}
-	case PingTypeLeft:
-		logger.Infof("Peer %s has left the network", pingMsg.PeerID)
-		if pingMsg.TTL > 0 {
-			n.floodMessage(pingMsg, senderPeerID)
-		}
-	}
-	stream.Close()
-}
-
-// floodMessage forwards a presence message to all connected peers except the sender and self
-func (n *NetworkManager) floodMessage(msg PingMessage, excludePeer peer.ID) {
-	peers := n.GetPeers()
-	for _, p := range peers {
-		if p.ID == excludePeer || p.ID == n.host.ID() {
-			continue
-		}
-		if msg.OriginID != "" && string(p.ID) == msg.OriginID {
-			continue
-		}
-
-		go func(targetPeer peer.ID) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			forwardedMsg := BuildForwardMessage(msg, n.host.ID().String())
-			stream, err := n.host.NewStream(ctx, targetPeer, protocol.ID(constants.PingProtocolID))
-			if err != nil {
-				logger.Debugf("Failed to forward message to peer peer_id=%s error=%v", targetPeer, err)
-				return
-			}
-			defer stream.Close()
-
-			if err := WritePingMessage(stream, forwardedMsg); err != nil {
-				logger.Debugf("Failed to send forwarded message to peer peer_id=%s error=%v", targetPeer, err)
-				return
-			}
-			logger.Debugf("Flooded %s message to peer peer_id=%s", msg.Type, targetPeer)
-		}(p.ID)
-	}
 }

@@ -8,11 +8,21 @@ import (
 	"net/http"
 	"net/url"
 	pathpkg "path"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/p-society/raag/internal/constants"
 )
+
+var sharedHTTPClient = &http.Client{
+	Timeout: constants.HTTPClientTimeout,
+	Transport: &http.Transport{
+		MaxIdleConns:      10,
+		IdleConnTimeout:   30 * time.Second,
+		DisableKeepAlives: false,
+	},
+}
 
 type TrackerClient struct {
 	trackerURL string
@@ -40,7 +50,7 @@ type trackerAddrResponse struct {
 func NewTrackerClient(trackerURL string) *TrackerClient {
 	return &TrackerClient{
 		trackerURL: trackerURL,
-		client:     &http.Client{Timeout: constants.HTTPClientTimeout},
+		client:     sharedHTTPClient,
 	}
 }
 

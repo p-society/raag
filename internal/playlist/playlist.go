@@ -2,6 +2,8 @@ package playlist
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 
 	"github.com/p-society/raag/internal/metadata"
@@ -79,12 +81,7 @@ func (m *Manager) RemoveSong(playlistName string, index int) error {
 func (m *Manager) List() []string {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-
-	names := make([]string, 0, len(m.Playlists))
-	for name := range m.Playlists {
-		names = append(names, name)
-	}
-	return names
+	return slices.Sorted(maps.Keys(m.Playlists))
 }
 
 func (m *Manager) GetSongs(playlistName string) ([]metadata.Song, error) {

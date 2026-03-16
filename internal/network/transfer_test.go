@@ -19,7 +19,7 @@ func TestBuildTransferMetadata(t *testing.T) {
 		Path:   "/tmp/test.flac",
 	}
 
-	meta := buildTransferMetadata(song, 1234, "deadbeef")
+	meta := buildTransferMetadata(song, 1234, "deadbeef", "", "")
 	if meta.Version != constants.ShareProtocolVersion {
 		t.Fatalf("version = %q, want %q", meta.Version, constants.ShareProtocolVersion)
 	}

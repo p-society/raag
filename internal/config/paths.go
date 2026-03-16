@@ -22,12 +22,12 @@ func FilePath() (string, error) {
 	return filepath.Join(dir, "config.yaml"), nil
 }
 
-func SocketPath() (string, error) {
+func SocketPath() string {
 	dir, err := Dir()
 	if err != nil {
-		return "", err
+		return "/tmp/raag-daemon.sock"
 	}
-	return filepath.Join(dir, "daemon.sock"), nil
+	return filepath.Join(dir, "daemon.sock")
 }
 
 func PeerPersistencePath() (string, error) {
@@ -60,4 +60,12 @@ func IdentityKeyPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "identity.key"), nil
+}
+
+func MusicDir() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "music"), nil
 }

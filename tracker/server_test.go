@@ -2,8 +2,6 @@ package tracker
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,12 +14,12 @@ import (
 )
 
 func TestHandleRegisterPeerRejectsMismatchedIdentityClaims(t *testing.T) {
-	authPriv, err := auth.GenerateAuthKeyPair()
+	_, authPriv, err := auth.GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("generate auth key: %v", err)
 	}
 
-	trustedAuthKey := hex.EncodeToString(authPriv.Public().(ed25519.PublicKey))
+	trustedAuthKey := auth.GetPublicKeyHex(authPriv)
 	requestPeerID := mustPeerID(t)
 	otherPeerID := mustPeerID(t)
 	tests := []struct {
@@ -74,9 +72,9 @@ func TestHandleRegisterPeerRejectsMismatchedIdentityClaims(t *testing.T) {
 			if err := json.Unmarshal(body, &request); err != nil {
 				t.Fatalf("unmarshal request: %v", err)
 			}
+
 			request["auth_data"] = authData
 			request["addrs"] = []string{addrForPeer(tc.addrPeerID)}
-
 			body, err = json.Marshal(request)
 			if err != nil {
 				t.Fatalf("marshal request: %v", err)
@@ -96,12 +94,12 @@ func TestHandleRegisterPeerRejectsMismatchedIdentityClaims(t *testing.T) {
 }
 
 func TestHandleRegisterPeerAcceptsMatchingIdentityClaims(t *testing.T) {
-	authPriv, err := auth.GenerateAuthKeyPair()
+	_, authPriv, err := auth.GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("generate auth key: %v", err)
 	}
 
-	trustedAuthKey := hex.EncodeToString(authPriv.Public().(ed25519.PublicKey))
+	trustedAuthKey := auth.GetPublicKeyHex(authPriv)
 	peerID := mustPeerID(t)
 	token, err := auth.GenerateToken(peerID, authPriv)
 	if err != nil {
@@ -159,4 +157,71 @@ func addrForPeer(id peer.ID) string {
 
 func quicAddrForPeer(id peer.ID) string {
 	return "/ip4/127.0.0.1/udp/45678/quic-v1/p2p/" + id.String()
+}
+
+func TestRateLimiterAllowsWithinLimit(t *testing.T) {
+	rl := NewRateLimiter()
+	ip := "192.168.1.1"
+	for i := range 10 {
+		if !rl.Allow(ip) {
+			t.Errorf("Allow() should return true for requests 1-10, failed at %d", i+1)
+		}
+	}
+}
+
+func TestRateLimiterBlocksAfterLimit(t *testing.T) {
+	rl := NewRateLimiter()
+	ip := "192.168.1.1"
+	for range 10 {
+		rl.Allow(ip)
+	}
+	if rl.Allow(ip) {
+		t.Error("Allow() should return false after rate limit exceeded")
+	}
+}
+
+func TestRateLimiterDifferentIPsIndependent(t *testing.T) {
+	rl := NewRateLimiter()
+	for i := range 10 {
+		if !rl.Allow("192.168.1.1") {
+			t.Errorf("Allow() should return true for IP1 requests 1-10, failed at %d", i+1)
+		}
+	}
+	if !rl.Allow("192.168.1.2") {
+		t.Error("Allow() should return true for different IP after other IP hit limit")
+	}
+}
+
+func TestHandleRegisterPeerMethodNotAllowed(t *testing.T) {
+	tr := NewTracker(TrackerConfig{})
+	req := httptest.NewRequest(http.MethodGet, "/register", nil)
+	rec := httptest.NewRecorder()
+
+	tr.handleRegisterPeer(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestHandleRegisterPeerMissingPeerID(t *testing.T) {
+	tr := NewTracker(TrackerConfig{})
+	body, _ := json.Marshal(map[string]string{})
+	req := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	tr.handleRegisterPeer(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleRegisterPeerInvalidJSON(t *testing.T) {
+	tr := NewTracker(TrackerConfig{})
+	req := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader([]byte("not json")))
+	rec := httptest.NewRecorder()
+
+	tr.handleRegisterPeer(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
 }

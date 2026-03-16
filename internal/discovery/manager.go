@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -13,20 +14,21 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/p-society/raag/internal/auth"
 	"github.com/p-society/raag/internal/constants"
 	"github.com/p-society/raag/internal/logger"
+	"golang.org/x/sync/errgroup"
 )
 
 type Manager struct {
 	host           host.Host
+	ctx            context.Context
 	dht            *dht.IpfsDHT
 	discovery      *routing.RoutingDiscovery
-	peers          map[peer.ID]*peer.AddrInfo
-	mu             sync.RWMutex
 	persistence    *PeerPersistence
 	tracker        *TrackerClient
 	maxPeers       int
@@ -40,54 +42,77 @@ type Manager struct {
 	networkManager interface {
 		NotifyPeerConnected(peerID peer.ID, addr string)
 	}
-	onPeerSave      func(peers []peer.AddrInfo)
-	mdnsPeerCount   uint64
-	connectingPeers map[peer.ID]bool
-	connectedPeers  map[peer.ID]time.Time
-	heartbeatEvery  time.Duration
-	refreshEvery    time.Duration
-	retryDelay      time.Duration
-	maxRetryDelay   time.Duration
+	onPeerSave              func(peers []peer.AddrInfo)
+	mdnsPeerCount           uint64
+	heartbeatEvery          time.Duration
+	refreshEvery            time.Duration
+	retryDelay              time.Duration
+	maxRetryDelay           time.Duration
+	lastBootstrap           time.Time
+	bootstrapThrottle       time.Duration
+	peerCountSinceBootstrap int
+	stateMu                 sync.RWMutex
 }
 
-func NewManager(h host.Host, identityKeyBytes []byte, trackerURL string, maxPeers int, listenHost string, rendezvous string, dhtEnabled bool, bootstrapPeers []string) *Manager {
+type ManagerConfig struct {
+	Host             host.Host
+	TrackerURL       string
+	IdentityKeyBytes []byte
+	AuthSecret       string
+	MaxPeers         int
+	ListenHost       string
+	Rendezvous       string
+	DHTEnabled       bool
+	BootstrapPeers   []string
+}
+
+func NewManager(cfg ManagerConfig) *Manager {
+	h := cfg.Host
 	var authKeyPair ed25519.PrivateKey
 	var err error
-	if len(identityKeyBytes) > 0 {
-		authKeyPair, err = auth.DeriveAuthKey(identityKeyBytes)
+
+	// Priority: AuthSecret > IdentityKey > Random
+	if cfg.AuthSecret != "" {
+		authKeyPair, err = auth.DeriveKey([]byte(cfg.AuthSecret), "raag-secret-v1")
+		if err != nil {
+			logger.Warnf("Failed to derive auth key from secret: %v", err)
+		} else {
+			logger.Infof("Auth enabled via shared secret")
+		}
+	} else if len(cfg.IdentityKeyBytes) > 0 {
+		authKeyPair, err = auth.DeriveKey(cfg.IdentityKeyBytes, "raag-identity-v1")
 		if err != nil {
 			logger.Warnf("Failed to derive auth key from identity: %v", err)
 		} else {
-			pubKey := hex.EncodeToString(authKeyPair.Public().(ed25519.PublicKey))
-			logger.Infof("Derived auth key from identity (pubkey: %s)", pubKey)
+			logger.Infof("Auth enabled via identity key")
 		}
 	}
 	if authKeyPair == nil {
-		authKeyPair, err = auth.GenerateAuthKeyPair()
+		_, authKeyPair, err = auth.GenerateKeyPair()
 		if err != nil {
 			logger.Warnf("Failed to generate auth key pair: %v", err)
 		} else {
-			logger.Warnf("No identity key provided, generated random auth key")
+			logger.Warnf("No auth configured, generated random key")
 		}
 	}
 	return &Manager{
-		host:            h,
-		peers:           make(map[peer.ID]*peer.AddrInfo),
-		persistence:     NewPeerPersistence(),
-		tracker:         NewTrackerClient(trackerURL),
-		maxPeers:        maxPeers,
-		trackerURL:      trackerURL,
-		listenHost:      listenHost,
-		rendezvous:      rendezvous,
-		dhtEnabled:      dhtEnabled,
-		bootstrapPeers:  slices.Clone(bootstrapPeers),
-		authKeyPair:     authKeyPair,
-		connectingPeers: make(map[peer.ID]bool),
-		connectedPeers:  make(map[peer.ID]time.Time),
-		heartbeatEvery:  constants.TrackerHeartbeatInterval,
-		refreshEvery:    constants.TrackerRefreshInterval,
-		retryDelay:      constants.TrackerRetryInitialDelay,
-		maxRetryDelay:   constants.TrackerRetryMaxDelay,
+		host:                    h,
+		persistence:             NewPeerPersistence(),
+		tracker:                 NewTrackerClient(cfg.TrackerURL),
+		maxPeers:                cfg.MaxPeers,
+		trackerURL:              cfg.TrackerURL,
+		listenHost:              cfg.ListenHost,
+		rendezvous:              cfg.Rendezvous,
+		dhtEnabled:              cfg.DHTEnabled,
+		bootstrapPeers:          slices.Clone(cfg.BootstrapPeers),
+		authKeyPair:             authKeyPair,
+		heartbeatEvery:          constants.TrackerHeartbeatInterval,
+		refreshEvery:            constants.TrackerRefreshInterval,
+		retryDelay:              constants.TrackerRetryInitialDelay,
+		maxRetryDelay:           constants.TrackerRetryMaxDelay,
+		lastBootstrap:           time.Now(),
+		bootstrapThrottle:       constants.DHTBootstrapThrottle,
+		peerCountSinceBootstrap: 0,
 	}
 }
 
@@ -117,14 +142,6 @@ func (m *Manager) SetTestIntervals(heartbeat, refresh, retryDelay, maxRetryDelay
 	}
 }
 
-func (m *Manager) MarkPeerConnected(peerID peer.ID) {
-	m.mu.Lock()
-	m.connectedPeers[peerID] = time.Now()
-	delete(m.connectingPeers, peerID)
-	m.mu.Unlock()
-	logger.Debugf("Marked peer as connected peer=%s", peerID)
-}
-
 type PeerInfo struct {
 	ID            string    `json:"id"`
 	Addr          string    `json:"addr"`
@@ -150,6 +167,9 @@ type NetworkState struct {
 }
 
 func (m *Manager) GetNetworkState() NetworkState {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+
 	state := NetworkState{
 		SelfID:         m.host.ID().String(),
 		ListenAddr:     "",
@@ -172,18 +192,19 @@ func (m *Manager) GetNetworkState() NetworkState {
 	if m.dht != nil {
 		state.DHTPeers = m.dht.RoutingTable().Size()
 	}
-	connectedPeers := m.host.Network().Peers()
 
-	m.mu.RLock()
+	connectedPeers := m.host.Network().Peers()
 	state.MDNSDiscovered = int(m.mdnsPeerCount)
-	for pid, p := range m.peers {
+	knownPeerIDs := m.host.Peerstore().Peers()
+	for _, pid := range knownPeerIDs {
 		if pid == m.host.ID() {
 			continue
 		}
 
 		var addrStr string
-		if len(p.Addrs) > 0 {
-			addrStr = p.Addrs[0].String()
+		addrs := m.host.Peerstore().Addrs(pid)
+		if len(addrs) > 0 {
+			addrStr = addrs[0].String()
 		}
 
 		connected := slices.Contains(connectedPeers, pid)
@@ -194,7 +215,6 @@ func (m *Manager) GetNetworkState() NetworkState {
 			DiscoveredVia: "DHT/mDNS",
 		})
 	}
-	m.mu.RUnlock()
 
 	for _, pid := range connectedPeers {
 		if pid == m.host.ID() {
@@ -212,7 +232,6 @@ func (m *Manager) GetNetworkState() NetworkState {
 			Connected: true,
 		})
 	}
-
 	return state
 }
 
@@ -253,6 +272,7 @@ func (m *Manager) LogNetworkState() {
 }
 
 func (m *Manager) Start(ctx context.Context) error {
+	m.ctx = ctx
 	if err := m.loadPersistedPeers(); err != nil {
 		logger.Errorf("Failed to load persisted peers error=%v", err)
 	}
@@ -260,23 +280,44 @@ func (m *Manager) Start(ctx context.Context) error {
 	logger.Debugf("Starting peer discovery from tracker...")
 	if err := m.discoverFromTracker(ctx); err != nil {
 		logger.Warnf("Initial tracker discovery failed error=%v", err)
+		go func() {
+			time.Sleep(2 * time.Second)
+			logger.Debugf("Retrying initial tracker discovery...")
+			if err := m.discoverFromTracker(context.Background()); err != nil {
+				logger.Debugf("Retry tracker discovery failed error=%v", err)
+			}
+		}()
 	}
 
-	go m.runTrackerRegistrationLoop(ctx)
-	go m.runTrackerRefreshLoop(ctx)
 	if err := m.connectBootstrapPeers(ctx); err != nil {
 		logger.Warnf("Failed to connect configured bootstrap peers error=%v", err)
 	}
-	if m.listenHost == "127.0.0.1" || m.listenHost == "localhost" {
-		logger.Debugf("Skipping mDNS discovery (localhost mode)")
-	} else {
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		m.runTrackerRegistrationLoop(ctx)
+		return nil
+	})
+	g.Go(func() error {
+		m.runTrackerRefreshLoop(ctx)
+		return nil
+	})
+
+	if m.listenHost != "127.0.0.1" && m.listenHost != "localhost" {
 		logger.Debugf("Starting mDNS discovery in background...")
-		go m.discoverViaMDNS(ctx)
-		go m.logMDNSStatus(ctx)
+		g.Go(func() error {
+			m.discoverViaMDNS(ctx)
+			return nil
+		})
+	} else {
+		logger.Debugf("Skipping mDNS discovery (localhost mode)")
 	}
 
 	if !m.dhtEnabled {
 		logger.Infof("DHT discovery disabled")
+		if err := g.Wait(); err != nil {
+			logger.Warnf("Background service error: %v", err)
+		}
 		return nil
 	}
 
@@ -286,9 +327,22 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.populateDHTFromConnectedPeers()
 
-	go m.logRoutingTableSize(ctx)
-	go m.discoverViaDHTRetry(ctx)
-	go m.advertisePeriodically(ctx)
+	g.Go(func() error {
+		m.logNetworkStatus(ctx)
+		return nil
+	})
+	g.Go(func() error {
+		m.discoverViaDHT(ctx)
+		return nil
+	})
+	g.Go(func() error {
+		m.advertisePeriodically(ctx)
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		logger.Warnf("Background service error: %v", err)
+	}
 	return nil
 }
 
@@ -313,6 +367,7 @@ func (m *Manager) selectAdvertisedAddresses(addrs []multiaddr.Multiaddr) []multi
 		if _, ok := seen[addrStr]; ok {
 			continue
 		}
+
 		seen[addrStr] = struct{}{}
 		selected = append(selected, addr)
 		if len(selected) >= maxAdvertisedAddrs {
@@ -325,49 +380,31 @@ func (m *Manager) selectAdvertisedAddresses(addrs []multiaddr.Multiaddr) []multi
 	return selected
 }
 
-func isReachableAddr(addr string) bool {
-	addrLower := strings.ToLower(addr)
-	if strings.Contains(addrLower, "/127.0.0.1/") || strings.Contains(addrLower, "/localhost/") {
+func isReachableAddr(addr multiaddr.Multiaddr) bool {
+	ipStr, err := addr.ValueForProtocol(multiaddr.P_IP4)
+	if err != nil {
+		return true
+	}
+
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
 		return false
 	}
-	if strings.HasPrefix(addrLower, "/ip4/172.") {
-		octets := strings.SplitSeq(addrLower, "/")
-		for octet := range octets {
-			if len(octet) == 3 && octet[0] == '1' && octet[1] == '7' && octet[2] == '2' {
-				return false
-			}
-		}
-	}
-	if strings.Contains(addrLower, "/172.1") || strings.Contains(addrLower, "/172.2") || strings.Contains(addrLower, "/172.3") {
-		return false
-	}
-	if strings.Contains(addrLower, "/192.168.122.") || strings.Contains(addrLower, "/192.168.124.") {
-		return false
-	}
-	if strings.Contains(addrLower, "/10.") && !strings.Contains(addrLower, "/192.168.") {
-		return false
-	}
-	if strings.HasPrefix(addrLower, "/ip4/169.254.") {
-		return false
-	}
-	if strings.HasPrefix(addrLower, "/ip4/224.") || strings.HasPrefix(addrLower, "/ip4/225.") || strings.HasPrefix(addrLower, "/ip4/226.") {
-		return false
-	}
-	return true
+	return !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsMulticast()
 }
 
 func filterReachableAddresses(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 	var filtered []multiaddr.Multiaddr
 	for _, addr := range addrs {
-		if isReachableAddr(addr.String()) {
+		if isReachableAddr(addr) {
 			filtered = append(filtered, addr)
 		} else {
-			logger.Debugf("Filtered unreachable address: %s", addr.String())
+			logger.Debugf("Filtered private address: %s", addr.String())
 		}
 	}
-	if len(filtered) == 0 && len(addrs) > 0 {
-		logger.Debugf("All addresses filtered, using original list")
-		return addrs
+	if len(filtered) == 0 {
+		logger.Warnf("No public addresses available, will use observed IP from tracker")
+		return nil
 	}
 	return filtered
 }
@@ -390,17 +427,37 @@ func prioritizeAddresses(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 }
 
 func (m *Manager) getAuthData() (string, error) {
-	if m.authToken == nil && m.authKeyPair != nil {
-		token, err := auth.GenerateToken(m.host.ID(), m.authKeyPair)
-		if err != nil {
-			return "", fmt.Errorf("failed to generate auth token: %w", err)
-		}
-		m.authToken = token
-	}
+	m.regenerateAuthToken()
 	if m.authToken == nil {
 		return "", fmt.Errorf("no auth key pair available")
 	}
 	return auth.SerializeToken(m.authToken)
+}
+
+func (m *Manager) regenerateAuthToken() {
+	if m.authKeyPair == nil {
+		return
+	}
+	if m.authToken != nil {
+		timeUntilExpiry := time.Until(time.Unix(m.authToken.ExpiresAt, 0))
+		if timeUntilExpiry > constants.TokenRefreshThreshold {
+			return
+		}
+		logger.Debugf("Token expiring soon (%v), regenerating", timeUntilExpiry)
+	}
+
+	token, err := auth.GenerateToken(m.host.ID(), m.authKeyPair)
+	if err != nil {
+		logger.Warnf("Failed to regenerate auth token: %v", err)
+		return
+	}
+
+	m.authToken = token
+	logger.Infof("Auth token regenerated, expires in %v", time.Until(time.Unix(token.ExpiresAt, 0)))
+}
+
+func (m *Manager) GetAuthData() (string, error) {
+	return m.getAuthData()
 }
 
 func (m *Manager) GetAuthPublicKey() string {
@@ -489,12 +546,14 @@ func (m *Manager) tryRefreshRegistration(ctx context.Context) error {
 
 	advertisedAddrs := m.selectAdvertisedAddresses(addrs)
 	if len(advertisedAddrs) == 0 {
-		return fmt.Errorf("host has no advertisable addresses")
+		logger.Debugf("No public addresses, letting tracker use observed IP")
 	}
+
 	addrWithPeerID := make([]string, 0, len(advertisedAddrs))
 	for _, addr := range advertisedAddrs {
 		addrWithPeerID = append(addrWithPeerID, addr.Encapsulate(multiaddr.StringCast("/p2p/"+m.host.ID().String())).String())
 	}
+
 	peerID := m.host.ID().String()
 	authData, err := m.getAuthData()
 	if err != nil {
@@ -509,8 +568,8 @@ func (m *Manager) tryRefreshRegistration(ctx context.Context) error {
 }
 
 func (m *Manager) UpdateTrackerURL(ctx context.Context, newURL string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 
 	if newURL == m.trackerURL {
 		return
@@ -548,11 +607,9 @@ func (m *Manager) loadPersistedPeers() error {
 		return nil
 	}
 
-	m.mu.Lock()
 	for _, p := range peers {
-		m.peers[p.ID] = &p
+		m.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.PermanentAddrTTL)
 	}
-	m.mu.Unlock()
 
 	logger.Debugf("Loaded persisted peers count=%d", len(peers))
 	return nil
@@ -602,18 +659,38 @@ func (m *Manager) discoverFromTracker(ctx context.Context) error {
 			logger.Warnf("Failed to connect to tracker peer peer=%s error=%v", p.ID, err)
 		} else {
 			logger.Infof("Connected to tracker peer peer=%s", p.ID)
-			m.addAsBootstrap(ctx, p)
+			m.addAsBootstrap(ctx)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) addAsBootstrap(ctx context.Context, p peer.AddrInfo) {
+func (m *Manager) addAsBootstrap(ctx context.Context) {
+	if m.dht == nil {
+		return
+	}
+	m.throttledBootstrap(ctx)
+}
+
+func (m *Manager) throttledBootstrap(ctx context.Context) {
 	if m.dht == nil {
 		return
 	}
 
-	logger.Debugf("Running DHT bootstrap after connecting to tracker peer peer=%s", p.ID)
+	m.stateMu.Lock()
+	m.peerCountSinceBootstrap++
+	timeSinceLastBootstrap := time.Since(m.lastBootstrap)
+	if timeSinceLastBootstrap < m.bootstrapThrottle && m.peerCountSinceBootstrap < constants.DHTBootstrapPeerThreshold {
+		m.stateMu.Unlock()
+		logger.Debugf("Skipping DHT bootstrap: throttled (timeSinceLast=%v, peerCountSince=%d)",
+			timeSinceLastBootstrap, m.peerCountSinceBootstrap)
+		return
+	}
+
+	m.lastBootstrap = time.Now()
+	m.peerCountSinceBootstrap = 0
+	m.stateMu.Unlock()
+
 	bootstrapCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := m.dht.Bootstrap(bootstrapCtx); err != nil {
@@ -623,30 +700,22 @@ func (m *Manager) addAsBootstrap(ctx context.Context, p peer.AddrInfo) {
 }
 
 func (m *Manager) savePeer(p peer.AddrInfo, skipAutoConnect bool) {
-	m.mu.Lock()
-
-	_, alreadyConnected := m.connectedPeers[p.ID]
-	_, alreadyConnecting := m.connectingPeers[p.ID]
-	if _, exists := m.peers[p.ID]; !exists {
-		if len(m.peers) >= m.maxPeers {
-			m.mu.Unlock()
+	alreadyConnected := slices.Contains(m.host.Network().Peers(), p.ID)
+	knownPeers := m.host.Peerstore().Peers()
+	alreadyKnown := slices.Contains(knownPeers, p.ID)
+	if !alreadyKnown {
+		if len(knownPeers) >= m.maxPeers {
 			return
 		}
 
-		m.peers[p.ID] = &p
-		m.mu.Unlock()
-
+		m.host.Peerstore().AddAddrs(p.ID, p.Addrs, peerstore.PermanentAddrTTL)
 		m.persistPeers()
 		logger.Debugf("Saved new peer peer=%s", p.ID)
-		if !skipAutoConnect && !alreadyConnected && !alreadyConnecting {
+		if !skipAutoConnect && !alreadyConnected {
 			m.tryConnectToPeer(p)
-		} else if alreadyConnecting {
-			logger.Debugf("Peer already connecting, skipping duplicate connection attempt peer=%s", p.ID)
 		} else if alreadyConnected {
 			logger.Debugf("Peer already connected, skipping connection attempt peer=%s", p.ID)
 		}
-	} else {
-		m.mu.Unlock()
 	}
 }
 
@@ -658,21 +727,10 @@ func (m *Manager) tryConnectToPeer(p peer.AddrInfo) {
 }
 
 func (m *Manager) connectWithRetry(p peer.AddrInfo) {
-	m.mu.Lock()
-	if m.connectingPeers[p.ID] {
-		m.mu.Unlock()
-		logger.Debugf("Already connecting to peer, skipping peer=%s", p.ID)
+	if len(m.host.Network().ConnsToPeer(p.ID)) > 0 {
+		logger.Debugf("Already connected to peer, skipping peer=%s", p.ID)
 		return
 	}
-	m.connectingPeers[p.ID] = true
-	m.mu.Unlock()
-
-	defer func() {
-		m.mu.Lock()
-		delete(m.connectingPeers, p.ID)
-		m.mu.Unlock()
-	}()
-
 	if len(p.Addrs) > 0 {
 		filteredAddrs := filterReachableAddresses(p.Addrs)
 		prioritizedAddrs := prioritizeAddresses(filteredAddrs)
@@ -684,13 +742,17 @@ func (m *Manager) connectWithRetry(p peer.AddrInfo) {
 	maxRetries := 3
 	retryDelays := []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
 	for attempt := range maxRetries {
-		connectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		connectCtx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 		logger.Debugf("Attempting to connect to peer peer=%s attempt=%d/%d", p.ID, attempt+1, maxRetries)
 		if err := m.host.Connect(connectCtx, p); err != nil {
 			cancel()
 			if attempt < maxRetries-1 {
 				logger.Warnf("Connection failed, retrying in %v peer=%s error=%v", retryDelays[attempt], p.ID, err)
-				time.Sleep(retryDelays[attempt])
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-time.After(retryDelays[attempt]):
+				}
 				continue
 			}
 			logger.Warnf("Failed to connect to peer after %d attempts peer=%s error=%v", maxRetries, p.ID, err)
@@ -698,18 +760,7 @@ func (m *Manager) connectWithRetry(p peer.AddrInfo) {
 		}
 
 		logger.Infof("Connected to discovered peer peer=%s", p.ID)
-		m.mu.Lock()
-		m.connectedPeers[p.ID] = time.Now()
-		m.mu.Unlock()
-
-		if m.dht != nil {
-			dhtCtx, dhtCancel := context.WithTimeout(connectCtx, 10*time.Second)
-			if err := m.dht.Bootstrap(dhtCtx); err != nil {
-				logger.Warnf("DHT bootstrap after peer connect error=%v", err)
-			}
-			dhtCancel()
-		}
-
+		m.throttledBootstrap(m.ctx)
 		cancel()
 		if m.networkManager != nil {
 			addr := ""
@@ -722,26 +773,35 @@ func (m *Manager) connectWithRetry(p peer.AddrInfo) {
 	}
 }
 
-// GetAllPeers returns all known peers (persisted)
+// GetAllPeers returns all known peers from the peerstore
 func (m *Manager) GetAllPeers() []peer.AddrInfo {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var peersList []peer.AddrInfo
-	for _, p := range m.peers {
-		peersList = append(peersList, *p)
+	peerIDs := m.host.Peerstore().Peers()
+	peersList := make([]peer.AddrInfo, 0, len(peerIDs))
+	for _, pid := range peerIDs {
+		if pid == m.host.ID() {
+			continue
+		}
+		addrs := m.host.Peerstore().Addrs(pid)
+		if len(addrs) > 0 {
+			peersList = append(peersList, peer.AddrInfo{ID: pid, Addrs: addrs})
+		}
 	}
 	return peersList
 }
 
 func (m *Manager) persistPeers() {
-	m.mu.RLock()
 	var peersList []peer.AddrInfo
-	for _, peer := range m.peers {
-		peersList = append(peersList, *peer)
-	}
+	peerIDs := m.host.Peerstore().Peers()
+	for _, pid := range peerIDs {
+		if pid == m.host.ID() {
+			continue
+		}
 
-	m.mu.RUnlock()
+		addrs := m.host.Peerstore().Addrs(pid)
+		if len(addrs) > 0 {
+			peersList = append(peersList, peer.AddrInfo{ID: pid, Addrs: addrs})
+		}
+	}
 	if err := m.persistence.Save(peersList); err != nil {
 		logger.Errorf("Failed to save peers to disk error=%v", err)
 	} else {
@@ -811,15 +871,24 @@ func (m *Manager) initDHT(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) waitForPeers(timeout time.Duration) bool {
+func (m *Manager) waitForPeers(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
 		connectedPeers := len(m.host.Network().Peers())
 		if connectedPeers > 1 {
 			logger.Debugf("Found connected peers, proceeding with DHT count=%d", connectedPeers-1)
 			return true
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 	logger.Debugf("Timeout waiting for peers found=%d", len(m.host.Network().Peers())-1)
 	return false
@@ -839,13 +908,7 @@ func (m *Manager) populateDHTFromConnectedPeers() {
 		count++
 	}
 	if count > 0 {
-		logger.Debugf("Running DHT bootstrap peerCount=%d", count)
-		bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := m.dht.Bootstrap(bootstrapCtx); err != nil {
-			logger.Errorf("DHT bootstrap failed error=%v", err)
-		}
-		logger.Debugf("DHT routing table size count=%d", m.dht.RoutingTable().Size())
+		m.throttledBootstrap(m.ctx)
 	}
 }
 
@@ -866,7 +929,7 @@ func (m *Manager) advertisePeriodically(ctx context.Context) {
 	}
 }
 
-func (m *Manager) logRoutingTableSize(ctx context.Context) {
+func (m *Manager) logNetworkStatus(ctx context.Context) {
 	ticker := time.NewTicker(constants.DHTLogInterval)
 	defer ticker.Stop()
 
@@ -875,16 +938,22 @@ func (m *Manager) logRoutingTableSize(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			dhtSize := 0
+			peerstoreCount := 0
+			connectedCount := 0
 			if m.dht != nil {
-				m.mu.RLock()
-				connectedCount := len(m.peers)
-				m.mu.RUnlock()
-
-				dhtSize := m.dht.RoutingTable().Size()
-				networkPeers := len(m.host.Network().Peers())
-				logger.Debugf("DHT status: routing_table_size=%d total_discovered_peers=%d active_connections=%d",
-					dhtSize, connectedCount, networkPeers)
+				dhtSize = m.dht.RoutingTable().Size()
 			}
+			if m.host != nil {
+				peerstoreCount = len(m.host.Peerstore().Peers())
+				connectedCount = len(m.host.Network().Peers())
+			}
+
+			m.stateMu.RLock()
+			mdnsPeers := int(m.mdnsPeerCount)
+			m.stateMu.RUnlock()
+			logger.Debugf("Network status: dht_routing=%d peerstore=%d connected=%d mdns=%d",
+				dhtSize, peerstoreCount, connectedCount, mdnsPeers)
 		}
 	}
 }
@@ -899,7 +968,7 @@ func (m *Manager) discoverViaDHT(ctx context.Context) {
 	logger.Debugf("DHT: Advertisement complete")
 
 	logger.Debugf("DHT: Waiting for peer connections...")
-	hasPeers := m.waitForPeers(constants.DHTWaitForPeersTimeout)
+	hasPeers := m.waitForPeers(ctx, constants.DHTWaitForPeersTimeout)
 	m.populateDHTFromConnectedPeers()
 	if !hasPeers {
 		logger.Debugf("DHT: No peers connected yet, starting discovery anyway")
@@ -938,9 +1007,8 @@ func (m *Manager) discoverViaDHT(ctx context.Context) {
 					continue
 				}
 
-				m.mu.RLock()
-				_, alreadyKnown := m.peers[p.ID]
-				m.mu.RUnlock()
+				knownPeers := m.host.Peerstore().Peers()
+				alreadyKnown := slices.Contains(knownPeers, p.ID)
 				if alreadyKnown {
 					continue
 				}
@@ -967,10 +1035,6 @@ func (m *Manager) discoverViaDHT(ctx context.Context) {
 	}
 }
 
-func (m *Manager) discoverViaDHTRetry(ctx context.Context) {
-	m.discoverViaDHT(ctx)
-}
-
 func (m *Manager) discoverViaMDNS(ctx context.Context) {
 	notifee := &mdnsNotifee{manager: m}
 	service := mdns.NewMdnsService(m.host, m.rendezvous, notifee)
@@ -984,23 +1048,6 @@ func (m *Manager) discoverViaMDNS(ctx context.Context) {
 	logger.Debugf("mDNS discovery stopped")
 }
 
-func (m *Manager) logMDNSStatus(ctx context.Context) {
-	ticker := time.NewTicker(constants.MDNSLogInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			m.mu.RLock()
-			mdnsCount := m.mdnsPeerCount
-			m.mu.RUnlock()
-			logger.Debugf("mDNS status: discovered_peers=%d", mdnsCount)
-		}
-	}
-}
-
 type mdnsNotifee struct {
 	manager *Manager
 }
@@ -1010,12 +1057,14 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 		return
 	}
 
-	n.manager.mu.Lock()
-	_, alreadyKnown := n.manager.peers[pi.ID]
+	knownPeers := n.manager.host.Peerstore().Peers()
+	alreadyKnown := slices.Contains(knownPeers, pi.ID)
+
 	if !alreadyKnown {
+		n.manager.stateMu.Lock()
 		n.manager.mdnsPeerCount++
+		n.manager.stateMu.Unlock()
 	}
-	n.manager.mu.Unlock()
 
 	if alreadyKnown {
 		logger.Debugf("mDNS found already known peer, skipping peer=%s", pi.ID)

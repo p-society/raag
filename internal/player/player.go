@@ -15,6 +15,7 @@ import (
 	"github.com/faiface/beep/speaker"
 	"github.com/faiface/beep/vorbis"
 	"github.com/faiface/beep/wav"
+	"github.com/p-society/raag/internal/logger"
 	"github.com/p-society/raag/internal/metadata"
 )
 
@@ -31,6 +32,8 @@ type Player struct {
 	Duration     int
 	VolumeCtrl   *effects.Volume
 	mutex        sync.RWMutex
+	playerNext   func() error
+	trackEnded   chan struct{}
 }
 
 func NewPlayer() (*Player, error) {
@@ -64,7 +67,10 @@ func (p *Player) Play(song metadata.Song) error {
 	}
 
 	p.mutex.Lock()
-	p.stopPlaybackLocked()
+	p.stopPlaybackLocked() // Clean up old state first
+
+	p.trackEnded = make(chan struct{}, 1)
+	trackEnded := p.trackEnded
 
 	p.file = f
 	p.streamer = streamer
@@ -73,12 +79,31 @@ func (p *Player) Play(song metadata.Song) error {
 	p.Position = 0
 	p.Duration = duration
 
-	inLoop := beep.Loop(-1, streamer)
-	p.VolumeCtrl = &effects.Volume{Streamer: inLoop, Base: 2, Volume: volume}
-	p.ctrl = &beep.Ctrl{Streamer: p.VolumeCtrl}
+	seq := beep.Seq(streamer, beep.Callback(func() {
+		select {
+		case trackEnded <- struct{}{}:
+		default:
+		}
+	}))
+
+	p.ctrl = &beep.Ctrl{Streamer: seq}
+	p.VolumeCtrl = &effects.Volume{Streamer: p.ctrl, Base: 2, Volume: volume}
 	p.mutex.Unlock()
 
-	speaker.Play(p.ctrl)
+	speaker.Play(p.VolumeCtrl)
+	currentTrackEnded := trackEnded
+	go func() {
+		_, ok := <-currentTrackEnded
+		if !ok {
+			return
+		}
+		if p.playerNext != nil {
+			if err := p.playerNext(); err != nil {
+				logger.Debugf("Queue finished or error playing next: %v", err)
+			}
+		}
+	}()
+
 	fmt.Printf("Now playing: %s - %s\n", song.Title, song.Artist)
 	return nil
 }
@@ -129,26 +154,28 @@ func (p *Player) selectSongAtIndex(index int) (metadata.Song, error) {
 }
 
 func (p *Player) Pause() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	p.mutex.RLock()
+	ctrl := p.ctrl
+	p.mutex.RUnlock()
 
-	if p.ctrl != nil {
+	if ctrl != nil {
 		speaker.Lock()
-		p.ctrl.Paused = true
+		ctrl.Paused = true
 		speaker.Unlock()
-		fmt.Println("Playback paused")
+		logger.Infof("Playback paused")
 	}
 }
 
 func (p *Player) Resume() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	p.mutex.RLock()
+	ctrl := p.ctrl
+	p.mutex.RUnlock()
 
-	if p.ctrl != nil {
+	if ctrl != nil {
 		speaker.Lock()
-		p.ctrl.Paused = false
+		ctrl.Paused = false
 		speaker.Unlock()
-		fmt.Println("Playback resumed")
+		logger.Infof("Playback resumed")
 	}
 }
 
@@ -168,6 +195,10 @@ func (p *Player) stopPlaybackLocked() {
 	if p.ctrl != nil || p.streamer != nil {
 		speaker.Clear()
 	}
+	if p.trackEnded != nil {
+		close(p.trackEnded)
+		p.trackEnded = nil
+	}
 
 	p.ctrl = nil
 	p.streamer = nil
@@ -186,7 +217,6 @@ func (p *Player) stopPlaybackLocked() {
 func (p *Player) AddToQueue(song metadata.Song) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-
 	p.Queue = append(p.Queue, song)
 }
 
@@ -200,42 +230,38 @@ func (p *Player) GetQueue() []metadata.Song {
 }
 
 func (p *Player) Next() error {
-	p.mutex.RLock()
-	currentIndex := p.CurrentIndex
-	queueLen := len(p.Queue)
-	p.mutex.RUnlock()
-
-	if queueLen == 0 {
+	p.mutex.Lock()
+	if len(p.Queue) == 0 {
+		p.mutex.Unlock()
 		return fmt.Errorf("queue is empty")
 	}
-	if currentIndex >= queueLen-1 {
+	if p.CurrentIndex >= len(p.Queue)-1 {
+		p.mutex.Unlock()
 		return fmt.Errorf("end of queue")
 	}
 
-	song, err := p.selectSongAtIndex(currentIndex + 1)
-	if err != nil {
-		return err
-	}
+	p.CurrentIndex++
+	song := p.Queue[p.CurrentIndex]
+	p.mutex.Unlock()
+
 	return p.Play(song)
 }
 
 func (p *Player) Previous() error {
-	p.mutex.RLock()
-	currentIndex := p.CurrentIndex
-	queueLen := len(p.Queue)
-	p.mutex.RUnlock()
-
-	if queueLen == 0 {
+	p.mutex.Lock()
+	if len(p.Queue) == 0 {
+		p.mutex.Unlock()
 		return fmt.Errorf("queue is empty")
 	}
-	if currentIndex <= 0 {
+	if p.CurrentIndex <= 0 {
+		p.mutex.Unlock()
 		return fmt.Errorf("beginning of queue")
 	}
 
-	song, err := p.selectSongAtIndex(currentIndex - 1)
-	if err != nil {
-		return err
-	}
+	p.CurrentIndex--
+	song := p.Queue[p.CurrentIndex]
+	p.mutex.Unlock()
+
 	return p.Play(song)
 }
 
@@ -261,7 +287,9 @@ func (p *Player) SetVolume(level float64) error {
 
 	p.Volume = (level/100 - 1) * 10
 	if p.VolumeCtrl != nil {
+		speaker.Lock()
 		p.VolumeCtrl.Volume = p.Volume
+		speaker.Unlock()
 	}
 	fmt.Printf("Volume set to %.0f%%\n", level)
 	return nil
@@ -271,41 +299,35 @@ func (p *Player) GetVolume() float64 {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 
-	return (p.Volume + 1) * 100
+	return (p.Volume/10 + 1) * 100
 }
 
-func (p *Player) VolumeUp(amount float64) {
+func (p *Player) adjustVolume(delta float64) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
-	newVol := p.Volume + (amount / 10)
+	newVol := p.Volume + (delta / 10)
 	if newVol > 10 {
 		newVol = 10
-	}
-
-	p.Volume = newVol
-	if p.VolumeCtrl != nil {
-		p.VolumeCtrl.Volume = p.Volume
-	}
-
-	fmt.Printf("Volume: %.0f%%\n", (newVol/10+1)*100)
-}
-
-func (p *Player) VolumeDown(amount float64) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
-	newVol := p.Volume - (amount / 10)
-	if newVol < -10 {
+	} else if newVol < -10 {
 		newVol = -10
 	}
 
 	p.Volume = newVol
 	if p.VolumeCtrl != nil {
+		speaker.Lock()
 		p.VolumeCtrl.Volume = p.Volume
+		speaker.Unlock()
 	}
-
 	fmt.Printf("Volume: %.0f%%\n", (newVol/10+1)*100)
+}
+
+func (p *Player) VolumeUp(amount float64) {
+	p.adjustVolume(amount)
+}
+
+func (p *Player) VolumeDown(amount float64) {
+	p.adjustVolume(-amount)
 }
 
 func (p *Player) Seek(seconds int) error {
@@ -320,7 +342,12 @@ func (p *Player) Seek(seconds int) error {
 	if p.streamer.Len() > 0 && pos > p.streamer.Len() {
 		pos = p.streamer.Len()
 	}
-	if err := p.streamer.Seek(pos); err != nil {
+
+	speaker.Lock()
+	err := p.streamer.Seek(pos)
+	speaker.Unlock()
+
+	if err != nil {
 		return fmt.Errorf("seek error: %w", err)
 	}
 
@@ -333,7 +360,10 @@ func (p *Player) GetPosition() int {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 	if p.streamer != nil && p.format.SampleRate > 0 {
-		return p.streamer.Position() / int(p.format.SampleRate)
+		speaker.Lock()
+		pos := p.streamer.Position()
+		speaker.Unlock()
+		return pos / int(p.format.SampleRate)
 	}
 	return p.Position
 }
@@ -354,4 +384,8 @@ func (p *Player) IsPaused() bool {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 	return p.ctrl != nil && p.ctrl.Paused
+}
+
+func (p *Player) SetNextCallback(fn func() error) {
+	p.playerNext = fn
 }

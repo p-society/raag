@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/p-society/raag/internal/constants"
 	"github.com/p-society/raag/internal/logger"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // AuthToken represents a strong authentication token with signature
@@ -24,47 +26,24 @@ type AuthToken struct {
 	Nonce     string `json:"nonce"`
 }
 
-// TokenManager handles authentication tokens
-type TokenManager struct {
-	authorizedPeers map[string]*AuthToken
-}
-
-// NewTokenManager creates a new token manager
-func NewTokenManager() *TokenManager {
-	return &TokenManager{
-		authorizedPeers: make(map[string]*AuthToken),
-	}
-}
-
 // GenerateKeyPair generates a new ed25519 key pair for authentication
 func GenerateKeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	return ed25519.GenerateKey(rand.Reader)
 }
 
-// GenerateAuthKeyPair generates a new ed25519 private key for authentication
-func GenerateAuthKeyPair() (ed25519.PrivateKey, error) {
-	_, privKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate auth key pair: %w", err)
-	}
-	return privKey, nil
+// DeriveKey derives an ed25519 auth key from input bytes using a salt
+func DeriveKey(input []byte, salt string) (ed25519.PrivateKey, error) {
+	seed := pbkdf2.Key(input, []byte(salt), 50_000, 32, sha256.New)
+	return ed25519.NewKeyFromSeed(seed), nil
 }
 
-// DeriveAuthKey derives an ed25519 auth key from identity key bytes
-// This binds auth to identity
-func DeriveAuthKey(identityKeyBytes []byte) (ed25519.PrivateKey, error) {
-	salt := []byte("raag-auth-v1")
-	h := sha256.New()
-	h.Write(identityKeyBytes)
-	h.Write(salt)
-	seed := h.Sum(nil)
-
-	privKey := ed25519.NewKeyFromSeed(seed)
-	return privKey, nil
+// GetPublicKeyHex returns the hex-encoded public key from a private key
+func GetPublicKeyHex(privKey ed25519.PrivateKey) string {
+	return hex.EncodeToString(privKey.Public().(ed25519.PublicKey))
 }
 
 // GenerateToken creates a new authentication token for a peer
-func GenerateToken(peerID peer.ID, pubKey ed25519.PrivateKey) (*AuthToken, error) {
+func GenerateToken(peerID peer.ID, privKey ed25519.PrivateKey) (*AuthToken, error) {
 	nonce, err := generateNonce()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate nonce: %w", err)
@@ -73,13 +52,13 @@ func GenerateToken(peerID peer.ID, pubKey ed25519.PrivateKey) (*AuthToken, error
 	now := time.Now()
 	token := &AuthToken{
 		PeerID:    peerID.String(),
-		PublicKey: hex.EncodeToString(pubKey.Public().(ed25519.PublicKey)),
+		PublicKey: hex.EncodeToString(privKey.Public().(ed25519.PublicKey)),
 		Timestamp: now.Unix(),
-		ExpiresAt: now.Add(24 * time.Hour).Unix(),
+		ExpiresAt: now.Add(constants.TokenExpiration).Unix(),
 		Nonce:     nonce,
 	}
 
-	signature, err := signToken(token, pubKey)
+	signature, err := signToken(token, privKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign token: %w", err)
 	}
@@ -103,15 +82,20 @@ func signToken(token *AuthToken, privKey ed25519.PrivateKey) (string, error) {
 }
 
 // VerifyToken verifies an authentication token
-func (tm *TokenManager) VerifyToken(token *AuthToken) (bool, error) {
+func VerifyToken(token *AuthToken) (bool, error) {
 	if token.PeerID == "" {
 		return false, fmt.Errorf("empty peer ID")
 	}
 	if token.Signature == "" {
 		return false, fmt.Errorf("missing signature")
 	}
-	if time.Now().Unix() > token.ExpiresAt {
+
+	now := time.Now().Unix()
+	if now > token.ExpiresAt {
 		return false, fmt.Errorf("token expired")
+	}
+	if token.Timestamp > now+int64(constants.TokenFutureTolerance.Seconds()) {
+		return false, fmt.Errorf("token issued in the future (possible replay)")
 	}
 
 	pubKeyBytes, err := hex.DecodeString(token.PublicKey)
@@ -130,6 +114,9 @@ func (tm *TokenManager) VerifyToken(token *AuthToken) (bool, error) {
 	signature, err := base64.StdEncoding.DecodeString(token.Signature)
 	if err != nil {
 		return false, fmt.Errorf("invalid signature format: %w", err)
+	}
+	if len(pubKeyBytes) != ed25519.PublicKeySize {
+		return false, fmt.Errorf("invalid public key length")
 	}
 	if !ed25519.Verify(ed25519.PublicKey(pubKeyBytes), []byte(payload), signature) {
 		return false, fmt.Errorf("signature verification failed")
@@ -170,40 +157,6 @@ func DeserializeToken(data string) (*AuthToken, error) {
 	return &token, nil
 }
 
-// AddAuthorizedPeer adds a peer to the authorized list
-func (tm *TokenManager) AddAuthorizedPeer(token *AuthToken) {
-	tm.authorizedPeers[token.PeerID] = token
-	logger.Infof("Authorized peer added: %s", token.PeerID)
-}
-
-// RemoveAuthorizedPeer removes a peer from the authorized list
-func (tm *TokenManager) RemoveAuthorizedPeer(peerID string) {
-	delete(tm.authorizedPeers, peerID)
-	logger.Infof("Authorized peer removed: %s", peerID)
-}
-
-// IsAuthorized checks if a peer is authorized
-func (tm *TokenManager) IsAuthorized(peerID string) bool {
-	token, exists := tm.authorizedPeers[peerID]
-	if !exists {
-		return false
-	}
-	if time.Now().Unix() > token.ExpiresAt {
-		delete(tm.authorizedPeers, peerID)
-		return false
-	}
-	return true
-}
-
-// GetAuthorizedPeers returns all authorized peer IDs
-func (tm *TokenManager) GetAuthorizedPeers() []string {
-	var peers []string
-	for id := range tm.authorizedPeers {
-		peers = append(peers, id)
-	}
-	return peers
-}
-
 // TrustedKeyManager manages a list of trusted public keys
 type TrustedKeyManager struct {
 	trustedKeys map[string]struct{}
@@ -220,7 +173,11 @@ func NewTrustedKeyManager() *TrustedKeyManager {
 func (tk *TrustedKeyManager) AddKey(publicKeyHex string) {
 	if _, exists := tk.trustedKeys[publicKeyHex]; !exists {
 		tk.trustedKeys[publicKeyHex] = struct{}{}
-		logger.Infof("Added trusted auth key: %s...", publicKeyHex[:16])
+		prefix := publicKeyHex
+		if len(prefix) > 16 {
+			prefix = prefix[:16]
+		}
+		logger.Infof("Added trusted auth key: %s...", prefix)
 	}
 }
 
@@ -231,9 +188,9 @@ func (tk *TrustedKeyManager) IsTrusted(publicKeyHex string) bool {
 }
 
 // VerifyAndCheckTrust verifies a token and checks if its key is trusted
-func (tk *TrustedKeyManager) VerifyAndCheckTrust(token *AuthToken, tm *TokenManager) (bool, error) {
+func (tk *TrustedKeyManager) VerifyAndCheckTrust(token *AuthToken) (bool, error) {
 	if !tk.IsTrusted(token.PublicKey) {
 		return false, fmt.Errorf("public key not in trusted list")
 	}
-	return tm.VerifyToken(token)
+	return VerifyToken(token)
 }

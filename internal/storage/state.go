@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
+
+	"github.com/p-society/raag/internal/config"
 )
 
 type PlayerState struct {
@@ -19,8 +20,12 @@ type PlayerState struct {
 	LastPlayed time.Time `json:"last_played"`
 }
 
-func (s *Storage) LoadState() (*PlayerState, error) {
-	filePath := filepath.Join(s.configDir, "state.json")
+func LoadState() (*PlayerState, error) {
+	filePath, err := config.StatePath()
+	if err != nil {
+		return nil, err
+	}
+
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -41,18 +46,10 @@ func (s *Storage) LoadState() (*PlayerState, error) {
 	return &state, nil
 }
 
-func (s *Storage) SaveState(state *PlayerState) error {
-	filePath := filepath.Join(s.configDir, "state.json")
-	file, err := os.Create(filePath)
+func SaveState(state *PlayerState) error {
+	filePath, err := config.StatePath()
 	if err != nil {
-		return fmt.Errorf("error creating state file: %w", err)
+		return err
 	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(state); err != nil {
-		return fmt.Errorf("error encoding state: %w", err)
-	}
-	return nil
+	return WriteJSONAtomic(filePath, state)
 }

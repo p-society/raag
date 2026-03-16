@@ -5,11 +5,19 @@ services:
       dockerfile: Dockerfile
     container_name: raag-tracker
     ports:
-      - "8080:8080"
-      - "45678:45678"
+      - "${PORT:-8080}:${PORT:-8080}"
+      - "${LIBP2P_PORT:-45678}:${LIBP2P_PORT:-45678}"
     environment:
       PORT: "8080"
-      # AUTH_KEY: "your-key"  # Comma-separated for multiple keys
+      LIBP2P_PORT: "45678"
+      AUTH_SECRET: "raag-secret"
+      # TLS/HTTPS (optional)
+      # TLS_ENABLED: "true"
+      # TLS_CERT_FILE: "/app/certs/cert.pem"
+      # TLS_KEY_FILE: "/app/certs/key.pem"
+      # For Railway: Set AUTH_SECRET in Railway Dashboard → Variables
+      # For custom secret: AUTH_SECRET=yourpassword docker-compose up -d
+      # For HTTPS: TLS_ENABLED=true docker-compose up -d
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
